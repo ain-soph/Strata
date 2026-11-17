@@ -283,6 +283,8 @@ kernel void gr_up_f(device const uchar* w_up [[buffer(0)]], device const float* 
     template [[host_name("gr_down_q8_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_Q8_0>) gr_down_f<S, K, T_Q8_0, T_Q8_0>; \
     template [[host_name("gr_down_q8f_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_F32>) gr_down_f<S, K, T_Q8_0, T_F32>;
 GRD(8, 8) GRD(8, 4) GRD(4, 4) GRD(4, 2) GRD(16, 16) GRD(16, 8)
+// more rows per threadgroup (RS = SG / KS): the K-slice of xn is read from L1 by RS rows (decode-fusion's grid sweep)
+GRD(8, 2) GRD(8, 1) GRD(16, 4) GRD(16, 2) GRD(4, 1) GRD(32, 8) GRD(32, 4)
 template [[host_name("gr_up")]] kernel decltype(gr_up_f<T_BF16>) gr_up_f<T_BF16>;
 template [[host_name("gr_up_q8")]] kernel decltype(gr_up_f<T_Q8_0>) gr_up_f<T_Q8_0>;
 // the prefetching variants (the engine's default; STRATA_METAL_HCLD=0 keeps the originals above)

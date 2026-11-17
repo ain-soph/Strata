@@ -1994,6 +1994,27 @@ void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<con
         res.push_back({kind, what, n - v.size(), base_bars - bars(v), a[7], b[7]});
     };
     auto all = [](size_t) { return true; };
+    // STRATA_METAL_GRIDPROF=SG_KS,...: instead of the fusion variants, gr_down_q8_8_8 swapped for gr_down_q8_<SG>_<KS> (RS = SG / KS
+    // rows per threadgroup, SG simdgroups, the grid ceil(rows / RS)) in every layer of the window, each timed against the unchanged list
+    if (const char* gp = std::getenv("STRATA_METAL_GRIDPROF")) {
+        std::map<const mtl::Pipeline*, std::string> full;
+        for (const auto& [k, v] : pcache_) full[&v] = k;
+        std::stringstream ss(gp);
+        for (std::string it; std::getline(ss, it, ',');) {
+            const int sg = std::atoi(it.c_str()), ks = std::atoi(it.c_str() + it.find('_') + 1), rs = sg / ks;
+            std::vector<mtl::Dispatch> v = ds;
+            for (auto& d : v) {
+                if (!full.count(d.p) || full[d.p].rfind("gr_down_q8_8_8#", 0) != 0) continue;
+                const int ntok = std::atoi(full[d.p].c_str() + full[d.p].find('#') + 1);
+                const std::string fn = "gr_down_q8_" + it;
+                d.p = P(lib_, fn, mtl::Constants().i(1, ntok), fn + "#" + std::to_string(ntok));
+                const uint32_t rows = d.grid[0];   // LR + HC: one row per threadgroup in the 8_8 kernel
+                d.grid[0] = (rows + rs - 1) / rs;
+                d.tg[0] = 32 * sg;
+            }
+            run("grid", "gr_down_q8_" + it, v);
+        }
+    } else {
     run("none", "all barriers removed", variant(all, [](size_t i) { return i == 0; }));
     // the fusions in question: hc (gr_norm2 -> gr_down_q8 -> gr_up_q8 as one kernel per sub-layer), the router (its gemv and moe_route)
     run("fuse", "hc: gr_down + gr_up join gr_norm2's group", variant(all, [&](size_t i) { return !(starts(i, "gr_down") || starts(i, "gr_up")); }));
@@ -2010,6 +2031,7 @@ void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<con
         run("drop pipe", q, variant([&](size_t i) { return pl[i] != q; }, all));
         run("nobar pipe", q, variant(all, [&](size_t i) { return pl[i] != q; }));
     }
+    }
     std::fprintf(stderr, "strata metal fuseprof: window T%d, %zu dispatches, %zu barriers; variant time vs the unchanged list (15 interleaved pairs, medians)\n",
                  Tn, n, base_bars);
     FILE* of = std::fopen(std::getenv("STRATA_METAL_FUSEPROF"), "w");
@@ -2017,7 +2039,7 @@ void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<con
     for (const auto& r : res) {
         const double sv = r.base - r.ms;
         if (of) std::fprintf(of, "%s\t%s\t%zu\t%zu\t%.4f\t%.4f\t%.4f\t%.2f\n", r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
-        if (r.kind == "none" || r.kind == "fuse" || r.kind.find("part") != std::string::npos)
+        if (r.kind == "none" || r.kind == "fuse" || r.kind == "grid" || r.kind.find("part") != std::string::npos)
             std::fprintf(stderr, "strata metal fuseprof: %-10s %-46s -%4zu disp -%4zu bars  %7.3f -> %7.3f ms  saves %6.3f ms (%5.1f%%)\n",
                          r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
     }

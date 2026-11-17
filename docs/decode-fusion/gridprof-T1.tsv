@@ -1,0 +1,14 @@
+kind	what	dispatches_removed	barriers_removed	base_ms	variant_ms	saved_ms	saved_pct
+grid	gr_down_q8_8_8	0	0	9.6260	9.6250	0.0010	0.01
+grid	gr_down_q8_8_4	0	0	9.6291	9.6285	0.0007	0.01
+grid	gr_down_q8_4_4	0	0	9.6190	9.6055	0.0135	0.14
+grid	gr_down_q8_4_2	0	0	9.6197	9.6600	-0.0403	-0.42
+grid	gr_down_q8_16_16	0	0	9.6503	9.6317	0.0185	0.19
+grid	gr_down_q8_16_8	0	0	9.6705	9.6959	-0.0254	-0.26
+grid	gr_down_q8_8_2	0	0	9.6678	9.8134	-0.1456	-1.51
+grid	gr_down_q8_8_1	0	0	9.6797	9.8390	-0.1593	-1.65
+grid	gr_down_q8_16_4	0	0	9.6782	9.7603	-0.0821	-0.85
+grid	gr_down_q8_16_2	0	0	9.6717	9.8163	-0.1446	-1.49
+grid	gr_down_q8_4_1	0	0	9.6699	9.8308	-0.1609	-1.66
+grid	gr_down_q8_32_8	0	0	9.6639	9.7992	-0.1353	-1.40
+grid	gr_down_q8_32_4	0	0	9.6597	9.7553	-0.0956	-0.99

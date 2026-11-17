@@ -48,6 +48,29 @@ kernel-side gain left there (~0.4 ms at T3, none at T1). The hc cost is mostly s
 Revised plan: (2) gr_norm2 fused into gr_down (~0.35 ms, removes 97 barriers); (3) router GEMV + moe_route (~0.25 ms);
 (4) maybe a T>1 gr_down body (~0.4 ms at T3 only). Realistic total ~0.6-1.0 ms (~6-9%, ~117 -> ~125 tok/s).
 
+## Step 2: gr_norm2 folded into gr_down (negative)
+
+`gr_normdown_q8` (gr.metal): every gr_down threadgroup redoes gr_norm2's reduction in its own order (so rs would be
+bitwise the same) and makes xn on the fly; `STRATA_METAL_NDPROF=1` swaps it in for each gr_norm2 + gr_down pair, timed
+in situ (gr_up unchanged, so timing only). T1 9.70 -> 11.05 ms (+14%), T3 12.87 -> 18.61 ms (+45%): 324 threadgroups
+each re-reading the 4 x 2560 residual rows (and bo, w_norm) per token costs far more than the 97 barriers it removes.
+Dropped; the kernel stays on this branch as the record.
+
+## Cheaper synchronization? (negative)
+
+`STRATA_METAL_BARPROF=1` runs the unchanged window under other synchronization (`Context::run_graph_mode`):
+
+| synchronization | T1 | T3 |
+|---|---|---|
+| shipped: concurrent encoder + `memoryBarrierWithScope:Buffers` | 9.69 ms | 12.86 ms |
+| serial encoder, no explicit barriers | 10.74 ms (+10.9%) | 14.83 ms (+15.4%) |
+| concurrent, `memoryBarrierWithResources:` (the next dispatch's buffers only) | 9.69 ms (0.0%) | 12.87 ms (0.0%) |
+
+The M5 Ultra drains the whole GPU at a barrier whatever it names, and a serial encoder is worse. What is left is
+removing barriers without redundant work: a small tail step done by the last threadgroup of the kernel before it
+(a device atomic counter + device-scope fences, no spinning), e.g. moe_route after the router GEMV (~0.2 ms) and
+moe_combine after moe_down (~0.1 ms): ~3% together.
+
 ## Original plan (before step 1)
 
 Plan, in order of expected gain: (1) gr_down / gr_up grid and K-split for the Ultra (up to ~0.6-1.2 ms); (2) gr_norm2

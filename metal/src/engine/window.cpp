@@ -1996,6 +1996,40 @@ void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<con
     auto all = [](size_t) { return true; };
     // STRATA_METAL_GRIDPROF=SG_KS,...: instead of the fusion variants, gr_down_q8_8_8 swapped for gr_down_q8_<SG>_<KS> (RS = SG / KS
     // rows per threadgroup, SG simdgroups, the grid ceil(rows / RS)) in every layer of the window, each timed against the unchanged list
+    // STRATA_METAL_BARPROF=1: the unchanged list under other synchronization (run_graph_mode): a serial encoder, and barriers
+    // limited to the next dispatch's buffers; each interleaved with the shipped concurrent encoder + full buffer barriers
+    if (std::getenv("STRATA_METAL_BARPROF")) {
+        for (int mode : {1, 2}) {
+            std::vector<double> a, b;
+            for (int r = 0; r < 15; ++r) { a.push_back(1000.0 * cx_->run_graph(ds)); b.push_back(1000.0 * cx_->run_graph_mode(ds, mode)); }
+            std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+            res.push_back({"barrier", mode == 1 ? "serial encoder, no explicit barriers" : "barriers on the next dispatch's buffers only", 0, 0, a[7], b[7]});
+        }
+    } else
+    // STRATA_METAL_NDPROF=1: every gr_norm2 + gr_down_q8_8_8 pair replaced by one gr_normdown_q8 (decode-fusion step 2), with the
+    // norm's barrier; gr_up unchanged (it reads a stale xn: timing only)
+    if (std::getenv("STRATA_METAL_NDPROF")) {
+        std::map<const mtl::Pipeline*, std::string> full;
+        for (const auto& [k, v] : pcache_) full[&v] = k;
+        static mtl::Buffer rs_scratch = cx_->alloc(4096);
+        std::vector<mtl::Dispatch> v;
+        for (size_t i = 0; i < n; ++i) {
+            const bool pair = i + 1 < n && full.count(ds[i].p) && full.count(ds[i + 1].p) && full[ds[i].p].rfind("gr_norm2", 0) == 0 &&
+                              full[ds[i + 1].p].rfind("gr_down_q8_8_8#", 0) == 0;
+            if (!pair) { v.push_back(ds[i]); continue; }
+            const mtl::Dispatch& nm = ds[i];
+            const mtl::Dispatch& dn = ds[i + 1];
+            const int ntok = std::atoi(full[dn.p].c_str() + full[dn.p].find('#') + 1);
+            mtl::Dispatch f = dn;
+            f.p = P(lib_, "gr_normdown_q8", mtl::Constants().i(1, ntok), "gr_normdown_q8#" + std::to_string(ntok));
+            f.args = {dn.args[0], dn.args[1], nm.args[0], nm.args[1], nm.args[2], nm.args[3], dn.args[3], dn.args[4],
+                      mtl::Arg::B(rs_scratch), dn.args[5]};
+            f.barrier = nm.barrier;
+            v.push_back(std::move(f));
+            ++i;
+        }
+        run("normdown", "gr_norm2 + gr_down -> gr_normdown_q8", v);
+    } else
     if (const char* gp = std::getenv("STRATA_METAL_GRIDPROF")) {
         std::map<const mtl::Pipeline*, std::string> full;
         for (const auto& [k, v] : pcache_) full[&v] = k;
@@ -2039,7 +2073,7 @@ void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<con
     for (const auto& r : res) {
         const double sv = r.base - r.ms;
         if (of) std::fprintf(of, "%s\t%s\t%zu\t%zu\t%.4f\t%.4f\t%.4f\t%.2f\n", r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
-        if (r.kind == "none" || r.kind == "fuse" || r.kind == "grid" || r.kind.find("part") != std::string::npos)
+        if (r.kind == "none" || r.kind == "fuse" || r.kind == "grid" || r.kind == "normdown" || r.kind == "barrier" || r.kind.find("part") != std::string::npos)
             std::fprintf(stderr, "strata metal fuseprof: %-10s %-46s -%4zu disp -%4zu bars  %7.3f -> %7.3f ms  saves %6.3f ms (%5.1f%%)\n",
                          r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
     }

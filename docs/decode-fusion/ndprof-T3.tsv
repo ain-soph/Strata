@@ -1,0 +1,2 @@
+kind	what	dispatches_removed	barriers_removed	base_ms	variant_ms	saved_ms	saved_pct
+normdown	gr_norm2 + gr_down -> gr_normdown_q8	97	97	12.8648	18.6049	-5.7401	-44.62

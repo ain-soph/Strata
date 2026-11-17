@@ -1035,6 +1035,33 @@ double Context::run_graph(const std::vector<Dispatch>& ds, size_t count) {
     }
 }
 
+double Context::run_graph_mode(const std::vector<Dispatch>& ds, int mode) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:mode == 1 ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
+        for (size_t i = 0; i < ds.size(); ++i) {
+            if (mode == 2 && i > 0 && ds[i].barrier) {
+                std::vector<id<MTLResource>> rs;
+                for (const Arg& a : ds[i].args)
+                    if (a.buf) { size_t o; rs.push_back(BO(*a.buf, a.off, o)); }
+                if (ds[i].indirect) rs.push_back(B(*ds[i].indirect));
+                if (rs.empty()) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                else [enc memoryBarrierWithResources:rs.data() count:rs.size()];
+            }
+            encode(enc, ds[i]);
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
+            std::exit(5);
+        }
+        return cb.GPUEndTime - cb.GPUStartTime;
+    }
+}
+
 void* Context::run_graph_async(const std::vector<Dispatch>& ds) {
     @autoreleasepool {
         if (impl_->q2 == nil) impl_->q2 = [impl_->dev newCommandQueue];

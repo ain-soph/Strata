@@ -279,6 +279,92 @@ kernel void gr_up_f(device const uchar* w_up [[buffer(0)]], device const float* 
     }
 }
 
+// decode-fusion: gr_norm2 folded into gr_down (8 simdgroups, an 8-way K-split of one row per threadgroup, as gr_down_q8_8_8).
+// Every threadgroup first redoes gr_norm2's reduction for each (token, stream) in gr_norm2's own order (256 threads, 10
+// elements each at stride 256, simd_sum, the 8 partials in order), so rs is bitwise gr_norm2's; then the dot products read
+// xn = (R + bo g) w_norm rs made on the fly, the same operations as gr_norm2's store.  Nothing is written back here (R and
+// xn stay as they were); threadgroup 0 stores rs[t][c] for gr_up.  Buffers: 0 w_down, 1 w_inject, 2 R, 3 bo, 4 inj (the
+// previous sublayer's), 5 w_norm, 6 lo, 7 inject, 8 rs, 9 args.
+template <int F>
+kernel void gr_normdown_f(device const uchar* w_down [[buffer(0)]], device const uchar* w_inject [[buffer(1)]],
+                          device const float* R [[buffer(2)]], device const float* bo [[buffer(3)]],
+                          device const float* inj [[buffer(4)]], device const float* w_norm [[buffer(5)]],
+                          device float* lo [[buffer(6)]], device float* inject [[buffer(7)]], device float* rs_out [[buffer(8)]],
+                          constant GrArgs& a [[buffer(9)]],
+                          uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NJ = GR_NJ, KS = 8, UNIT = fmt<F>::UNIT;
+    threadgroup float part[8];
+    threadgroup float rsv[8][4], gv[8][4];
+    threadgroup float red[KS * 8];
+    threadgroup uint notab[1];
+    const int n = int(a.n_embd), hc = int(a.hc);
+    for (int t = 0; t < GR_NTOK; ++t)
+        for (int c = 0; c < hc; ++c) {
+            device const float* r = R + (t * hc + c) * n;
+            device const float* b = bo + t * n;
+            const float g = a.apply ? 2.0f / (1.0f + exp(-inj[t * hc + c] / float(a.hc))) : 0.0f;
+            float ss = 0.0f;
+            for (int j = 0; j < NJ; ++j) {
+                float v = r[tid + 256 * j];
+                if (a.apply) v = fma(b[tid + 256 * j], g, v);
+                ss = fma(v, v, ss);
+            }
+            ss = simd_sum(ss);
+            if (lane == 0) part[sg] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float tot = 0.0f;
+            for (int i = 0; i < 8; ++i) tot += part[i];
+            if (tid == 0) { rsv[t][c] = rsqrt(tot / float(n) + a.eps); gv[t][c] = g; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    if (tg.x == 0 && tid < uint(GR_NTOK * hc)) rs_out[tid] = rsv[tid / hc][tid % hc];
+    const int ks = sg, row = int(tg.x), nrows = int(a.hc_lr + a.hc), rr = min(row, nrows - 1);
+    const int nin = hc * n;
+    const uint rb = uint(nin / fmt<F>::QK * fmt<F>::BB);
+    device const uchar* w = rr < int(a.hc_lr) ? w_down + ulong(rr) * rb : w_inject + ulong(rr - int(a.hc_lr)) * rb;
+    float acc[8];
+    for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+    const int U = nin / UNIT, u0 = ks * U / KS, u1 = (ks + 1) * U / KS;
+    for (int u = u0 + lane; u < u1; u += 32) {
+        float q[UNIT];
+        float4 sc;
+        Dec<F>::run(w, u, q, sc, notab);
+        const int e0 = UNIT * u, c = e0 / n, i0 = e0 - c * n;
+        for (int t = 0; t < GR_NTOK; ++t) {
+            float xs[UNIT], xsum[2] = {0.0f, 0.0f};
+            device const float4* r4 = (device const float4*)(R + (t * hc + c) * n + i0);
+            device const float4* b4 = (device const float4*)(bo + t * n + i0);
+            device const float4* w4 = (device const float4*)(w_norm + c * n + i0);
+            const float g = gv[t][c], rs = rsv[t][c];
+            for (int k = 0; k < UNIT / 4; ++k) {
+                float4 v = r4[k];
+                if (a.apply) v = fma(b4[k], float4(g), v);
+                const float4 o = v * w4[k] * rs;
+                xs[4 * k] = o.x; xs[4 * k + 1] = o.y; xs[4 * k + 2] = o.z; xs[4 * k + 3] = o.w;
+            }
+            acc[t] += unit_combine<UNIT>(q, sc, xs, xsum);
+        }
+    }
+    for (int t = 0; t < GR_NTOK; ++t) {
+        const float v = simd_sum(acc[t]);
+        if (lane == 0) red[ks * 8 + t] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0 && lane < GR_NTOK && row < nrows) {
+        const int t = lane;
+        float v = 0.0f;
+        for (int k = 0; k < KS; ++k) v += red[k * 8 + t];
+        if (row < int(a.hc_lr)) {
+            const float z = v / float(a.hc);
+            lo[t * int(a.hc_lr) + row] = z / (1.0f + exp(-z));
+        } else {
+            inject[t * int(a.hc) + row - int(a.hc_lr)] = v;
+        }
+    }
+}
+template [[host_name("gr_normdown_q8")]] kernel decltype(gr_normdown_f<T_Q8_0>) gr_normdown_f<T_Q8_0>;
+
 #define GRD(S, K) template [[host_name("gr_down_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_BF16, T_BF16>) gr_down_f<S, K, T_BF16, T_BF16>; \
     template [[host_name("gr_down_q8_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_Q8_0>) gr_down_f<S, K, T_Q8_0, T_Q8_0>; \
     template [[host_name("gr_down_q8f_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_F32>) gr_down_f<S, K, T_Q8_0, T_F32>;

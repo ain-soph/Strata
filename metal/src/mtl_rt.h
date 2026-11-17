@@ -121,7 +121,10 @@ public:
     double run(const std::vector<Dispatch>& ds, int reps = 1, bool concurrent = false, bool barrier_between = false);
     // A dependency graph in ONE concurrent encoder: a memory barrier only before dispatches with `barrier` set, so
     // the dispatches between two barriers may overlap.  Returns the GPU time in seconds.
-    double run_graph(const std::vector<Dispatch>& ds, size_t count = (size_t) -1);   // count: only the first `count` dispatches (the step profile's prefixes)
+    double run_graph(const std::vector<Dispatch>& ds, size_t count = (size_t) -1);
+    // decode-fusion's barrier measurement: mode 1 = a serial encoder (Metal orders every dispatch after the one before, no explicit
+    // barriers); mode 2 = the concurrent encoder with each barrier limited to the buffers the next dispatch binds (memoryBarrierWithResources)
+    double run_graph_mode(const std::vector<Dispatch>& ds, int mode);   // count: only the first `count` dispatches (the step profile's prefixes)
     // run_graph on a SECOND queue, committed without waiting: the GPU may overlap it with work on the main queue (the two must touch
     // different buffers).  Returns a token; wait_async(token) blocks until it has completed (returns its GPU time in seconds).
     void* run_graph_async(const std::vector<Dispatch>& ds);

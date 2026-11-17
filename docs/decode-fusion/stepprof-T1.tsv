@@ -1,0 +1,708 @@
+0	1	xprep	-0.0793	0	xprep
+1	2	ple	0.0353	34816000	gemv_8_16_1_4_1
+2	1	hc	-0.0090	0	gr_norm2
+3	1	hc	0.0069	3525120	gr_down_q8_8_8
+4	1	hc	0.0072	3481600	gr_up_q8
+5	4	gdn dense	0.0441	44825600	gemv_8_16_1_4_1
+6	1	gdn other	0.0049	0	gdn_step
+7	1	gdn dense	0.0193	16711680	gemv_8_32_1_8_2
+8	1	hc	0.0091	0	gr_norm2
+9	1	hc	0.0066	3525120	gr_down_q8_8_8
+10	1	hc	0.0102	3481600	gr_up_q8
+11	4	router	0.0133	8734720	gemv_0_32_1_4_1
+12	2	router	0.0118	0	moe_route
+13	2	experts gate+up	0.0253	15820800	moe_gu_21_32_1_4
+14	1	experts down	0.0189	9216000	moe_down_20_4_2_4
+15	1	combine	0.0042	0	moe_combine_sh2
+16	1	hc	0.0042	0	gr_norm2
+17	2	ple	0.0097	0	ple_gnorm
+18	1	ple	0.0119	0	ple_gate_norm
+19	1	ple	0.0029	0	ple_conv_add
+20	1	hc	0.0040	0	gr_norm2
+21	1	hc	0.0071	3525120	gr_down_q8_8_8
+22	1	hc	0.0082	3481600	gr_up_q8
+23	4	gdn dense	0.0458	44825600	gemv_8_16_1_4_1
+24	1	gdn other	0.0105	0	gdn_step
+25	1	gdn dense	0.0215	16711680	gemv_8_32_1_8_2
+26	1	hc	0.0047	0	gr_norm2
+27	1	hc	0.0086	3525120	gr_down_q8_8_8
+28	1	hc	0.0055	3481600	gr_up_q8
+29	4	router	0.0146	8734720	gemv_0_32_1_4_1
+30	2	router	0.0107	0	moe_route
+31	2	experts gate+up	0.0268	15820800	moe_gu_21_32_1_4
+32	1	experts down	0.0126	9216000	moe_down_20_4_2_4
+33	1	combine	0.0020	0	moe_combine_sh2
+34	1	hc	0.0066	0	gr_norm2
+35	1	hc	0.0054	3525120	gr_down_q8_8_8
+36	1	hc	0.0047	3481600	gr_up_q8
+37	4	gdn dense	0.0486	44825600	gemv_8_16_1_4_1
+38	1	gdn other	0.0095	0	gdn_step
+39	1	gdn dense	0.0253	16711680	gemv_8_32_1_8_2
+40	1	hc	0.0052	0	gr_norm2
+41	1	hc	0.0008	3525120	gr_down_q8_8_8
+42	1	hc	0.0071	3481600	gr_up_q8
+43	4	router	0.0116	8734720	gemv_0_32_1_4_1
+44	2	router	0.0126	0	moe_route
+45	2	experts gate+up	0.0231	15820800	moe_gu_21_32_1_4
+46	1	experts down	0.0158	9216000	moe_down_20_4_2_4
+47	1	combine	0.0026	0	moe_combine_sh2
+48	1	hc	0.0062	0	gr_norm2
+49	1	hc	0.0057	3525120	gr_down_q8_8_8
+50	1	hc	0.0079	3481600	gr_up_q8
+51	5	qsa dense	0.0402	39485440	gemv_8_16_1_4_1
+52	1	qsa other	0.0042	0	qsa_prep
+53	1	qsa other	0.0392	0	qsa_attn
+54	1	qsa other	0.0055	0	qsa_merge
+55	1	qsa dense	0.0216	16711680	gemv_8_32_1_8_2
+56	1	hc	0.0035	0	gr_norm2
+57	1	hc	0.0050	3525120	gr_down_q8_8_8
+58	1	hc	0.0078	3481600	gr_up_q8
+59	4	router	0.0115	8734720	gemv_0_32_1_4_1
+60	2	router	0.0109	0	moe_route
+61	2	experts gate+up	0.0242	15820800	moe_gu_21_32_1_4
+62	1	experts down	0.0160	9216000	moe_down_20_4_2_4
+63	1	combine	0.0027	0	moe_combine_sh2
+64	1	hc	0.0062	0	gr_norm2
+65	1	hc	0.0060	3525120	gr_down_q8_8_8
+66	1	hc	0.0081	3481600	gr_up_q8
+67	4	gdn dense	0.0442	44825600	gemv_8_16_1_4_1
+68	1	gdn other	0.0118	0	gdn_step
+69	1	gdn dense	0.0197	16711680	gemv_8_32_1_8_2
+70	1	hc	0.0054	0	gr_norm2
+71	1	hc	0.0065	3525120	gr_down_q8_8_8
+72	1	hc	0.0057	3481600	gr_up_q8
+73	4	router	0.0133	8734720	gemv_0_32_1_4_1
+74	2	router	0.0107	0	moe_route
+75	2	experts gate+up	0.0228	12236800	moe_gu_22_32_1_4
+76	1	experts down	0.0204	9216000	moe_down_20_4_2_4
+77	1	combine	0.0054	0	moe_combine_sh2
+78	1	hc	0.0038	0	gr_norm2
+79	1	hc	0.0069	3525120	gr_down_q8_8_8
+80	1	hc	0.0016	3481600	gr_up_q8
+81	4	gdn dense	0.0501	44825600	gemv_8_16_1_4_1
+82	1	gdn other	0.0124	0	gdn_step
+83	1	gdn dense	0.0205	16711680	gemv_8_32_1_8_2
+84	1	hc	0.0037	0	gr_norm2
+85	1	hc	0.0077	3525120	gr_down_q8_8_8
+86	1	hc	0.0071	3481600	gr_up_q8
+87	4	router	0.0101	8734720	gemv_0_32_1_4_1
+88	2	router	0.0055	0	moe_route
+89	2	experts gate+up	0.0238	12236800	moe_gu_22_32_1_4
+90	1	experts down	0.0220	9216000	moe_down_20_4_2_4
+91	1	combine	-0.0005	0	moe_combine_sh2
+92	1	hc	0.0106	0	gr_norm2
+93	1	hc	0.0046	3525120	gr_down_q8_8_8
+94	1	hc	0.0076	3481600	gr_up_q8
+95	4	gdn dense	0.0445	44825600	gemv_8_16_1_4_1
+96	1	gdn other	0.0093	0	gdn_step
+97	1	gdn dense	0.0342	16711680	gemv_8_32_1_8_2
+98	1	hc	0.0038	0	gr_norm2
+99	1	hc	-0.0027	3525120	gr_down_q8_8_8
+100	1	hc	-0.0002	3481600	gr_up_q8
+101	4	router	0.0117	8734720	gemv_0_32_1_4_1
+102	2	router	0.0085	0	moe_route
+103	2	experts gate+up	0.0255	12236800	moe_gu_22_32_1_4
+104	1	experts down	0.0185	9216000	moe_down_20_4_2_4
+105	1	combine	0.0006	0	moe_combine_sh2
+106	1	hc	0.0116	0	gr_norm2
+107	1	hc	0.0005	3525120	gr_down_q8_8_8
+108	1	hc	0.0107	3481600	gr_up_q8
+109	5	qsa dense	0.0329	39485440	gemv_8_16_1_4_1
+110	1	qsa other	0.0059	0	qsa_prep
+111	1	qsa other	0.0479	0	qsa_attn
+112	1	qsa other	-0.0015	0	qsa_merge
+113	1	qsa dense	0.0188	16711680	gemv_8_32_1_8_2
+114	1	hc	0.0073	0	gr_norm2
+115	1	hc	0.0041	3525120	gr_down_q8_8_8
+116	1	hc	0.0078	3481600	gr_up_q8
+117	4	router	0.0123	8734720	gemv_0_32_1_4_1
+118	2	router	0.0095	0	moe_route
+119	2	experts gate+up	0.0230	12236800	moe_gu_22_32_1_4
+120	1	experts down	0.0161	9216000	moe_down_20_4_2_4
+121	1	combine	-0.0005	0	moe_combine_sh2
+122	1	hc	0.0057	0	gr_norm2
+123	1	hc	0.0114	3525120	gr_down_q8_8_8
+124	1	hc	0.0170	3481600	gr_up_q8
+125	4	gdn dense	0.0371	44825600	gemv_8_16_1_4_1
+126	1	gdn other	0.0058	0	gdn_step
+127	1	gdn dense	0.0246	16711680	gemv_8_32_1_8_2
+128	1	hc	0.0077	0	gr_norm2
+129	1	hc	0.0016	3525120	gr_down_q8_8_8
+130	1	hc	0.0069	3481600	gr_up_q8
+131	4	router	0.0188	8734720	gemv_0_32_1_4_1
+132	2	router	0.0062	0	moe_route
+133	2	experts gate+up	0.0244	12236800	moe_gu_22_32_1_4
+134	1	experts down	0.0195	9216000	moe_down_20_4_2_4
+135	1	combine	0.0209	0	moe_combine_sh2
+136	1	hc	-0.0013	0	gr_norm2
+137	1	hc	0.0072	3525120	gr_down_q8_8_8
+138	1	hc	-0.0107	3481600	gr_up_q8
+139	4	gdn dense	0.0584	44825600	gemv_8_16_1_4_1
+140	1	gdn other	0.0013	0	gdn_step
+141	1	gdn dense	0.0271	16711680	gemv_8_32_1_8_2
+142	1	hc	-0.0107	0	gr_norm2
+143	1	hc	0.0177	3525120	gr_down_q8_8_8
+144	1	hc	0.0222	3481600	gr_up_q8
+145	4	router	-0.0042	8734720	gemv_0_32_1_4_1
+146	2	router	0.0066	0	moe_route
+147	2	experts gate+up	0.0260	12236800	moe_gu_22_32_1_4
+148	1	experts down	0.0109	9216000	moe_down_20_4_2_4
+149	1	combine	0.0029	0	moe_combine_sh2
+150	1	hc	0.0048	0	gr_norm2
+151	1	hc	0.0061	3525120	gr_down_q8_8_8
+152	1	hc	0.0063	3481600	gr_up_q8
+153	4	gdn dense	0.0586	44825600	gemv_8_16_1_4_1
+154	1	gdn other	-0.0041	0	gdn_step
+155	1	gdn dense	0.0194	16711680	gemv_8_32_1_8_2
+156	1	hc	0.0040	0	gr_norm2
+157	1	hc	0.0305	3525120	gr_down_q8_8_8
+158	1	hc	0.0111	3481600	gr_up_q8
+159	4	router	-0.0140	8734720	gemv_0_32_1_4_1
+160	2	router	0.0161	0	moe_route
+161	2	experts gate+up	0.0185	12236800	moe_gu_22_32_1_4
+162	1	experts down	0.0086	9216000	moe_down_20_4_2_4
+163	1	combine	0.0079	0	moe_combine_sh2
+164	1	hc	0.0037	0	gr_norm2
+165	1	hc	0.0160	3525120	gr_down_q8_8_8
+166	1	hc	0.0096	3481600	gr_up_q8
+167	5	qsa dense	0.0419	39485440	gemv_8_16_1_4_1
+168	1	qsa other	-0.0115	0	qsa_prep
+169	1	qsa other	0.0497	0	qsa_attn
+170	1	qsa other	0.0059	0	qsa_merge
+171	1	qsa dense	0.0220	16711680	gemv_8_32_1_8_2
+172	1	hc	0.0070	0	gr_norm2
+173	1	hc	0.0067	3525120	gr_down_q8_8_8
+174	1	hc	0.0187	3481600	gr_up_q8
+175	4	router	-0.0109	8734720	gemv_0_32_1_4_1
+176	2	router	0.0109	0	moe_route
+177	2	experts gate+up	0.0347	12236800	moe_gu_22_32_1_4
+178	1	experts down	0.0062	9216000	moe_down_20_4_2_4
+179	1	combine	0.0125	0	moe_combine_sh2
+180	1	hc	-0.0107	0	gr_norm2
+181	1	hc	0.0249	3525120	gr_down_q8_8_8
+182	1	hc	0.0049	3481600	gr_up_q8
+183	4	gdn dense	0.0608	44825600	gemv_8_16_1_4_1
+184	1	gdn other	-0.0072	0	gdn_step
+185	1	gdn dense	0.0056	16711680	gemv_8_32_1_8_2
+186	1	hc	0.0056	0	gr_norm2
+187	1	hc	0.0079	3525120	gr_down_q8_8_8
+188	1	hc	0.0127	3481600	gr_up_q8
+189	4	router	0.0196	8734720	gemv_0_32_1_4_1
+190	2	router	0.0429	0	moe_route
+191	2	experts gate+up	-0.0215	12236800	moe_gu_22_32_1_4
+192	1	experts down	0.0145	9216000	moe_down_20_4_2_4
+193	1	combine	0.0052	0	moe_combine_sh2
+194	1	hc	0.0030	0	gr_norm2
+195	1	hc	0.0056	3525120	gr_down_q8_8_8
+196	1	hc	0.0094	3481600	gr_up_q8
+197	4	gdn dense	0.0458	44825600	gemv_8_16_1_4_1
+198	1	gdn other	0.0125	0	gdn_step
+199	1	gdn dense	0.0159	16711680	gemv_8_32_1_8_2
+200	1	hc	0.0212	0	gr_norm2
+201	1	hc	0.0066	3525120	gr_down_q8_8_8
+202	1	hc	0.0080	3481600	gr_up_q8
+203	4	router	0.0222	8734720	gemv_0_32_1_4_1
+204	2	router	0.0283	0	moe_route
+205	2	experts gate+up	-0.0058	12236800	moe_gu_22_32_1_4
+206	1	experts down	0.0277	9216000	moe_down_20_4_2_4
+207	1	combine	-0.0230	0	moe_combine_sh2
+208	1	hc	0.0024	0	gr_norm2
+209	1	hc	0.0187	3525120	gr_down_q8_8_8
+210	1	hc	0.0086	3481600	gr_up_q8
+211	4	gdn dense	0.0466	44825600	gemv_8_16_1_4_1
+212	1	gdn other	-0.0042	0	gdn_step
+213	1	gdn dense	0.0242	16711680	gemv_8_32_1_8_2
+214	1	hc	0.0056	0	gr_norm2
+215	1	hc	0.0013	3525120	gr_down_q8_8_8
+216	1	hc	0.0092	3481600	gr_up_q8
+217	4	router	0.0135	8734720	gemv_0_32_1_4_1
+218	2	router	0.0075	0	moe_route
+219	2	experts gate+up	0.0695	12236800	moe_gu_22_32_1_4
+220	1	experts down	-0.0096	9216000	moe_down_20_4_2_4
+221	1	combine	-0.0014	0	moe_combine_sh2
+222	1	hc	0.0047	0	gr_norm2
+223	1	hc	0.0194	3525120	gr_down_q8_8_8
+224	1	hc	0.0130	3481600	gr_up_q8
+225	5	qsa dense	0.0332	39485440	gemv_8_16_1_4_1
+226	1	qsa other	0.0141	0	qsa_prep
+227	1	qsa other	0.0152	0	qsa_attn
+228	1	qsa other	-0.0034	0	qsa_merge
+229	1	qsa dense	0.0421	16711680	gemv_8_32_1_8_2
+230	1	hc	0.0185	0	gr_norm2
+231	1	hc	-0.0179	3525120	gr_down_q8_8_8
+232	1	hc	-0.0074	3481600	gr_up_q8
+233	4	router	0.0115	8734720	gemv_0_32_1_4_1
+234	2	router	0.0082	0	moe_route
+235	2	experts gate+up	0.0388	12236800	moe_gu_22_32_1_4
+236	1	experts down	-0.0013	9216000	moe_down_20_4_2_4
+237	1	combine	0.0026	0	moe_combine_sh2
+238	1	hc	0.0032	0	gr_norm2
+239	1	hc	0.0073	3525120	gr_down_q8_8_8
+240	1	hc	0.0216	3481600	gr_up_q8
+241	4	gdn dense	0.0338	44825600	gemv_8_16_1_4_1
+242	1	gdn other	0.0097	0	gdn_step
+243	1	gdn dense	0.0224	16711680	gemv_8_32_1_8_2
+244	1	hc	0.0172	0	gr_norm2
+245	1	hc	0.0045	3525120	gr_down_q8_8_8
+246	1	hc	0.0446	3481600	gr_up_q8
+247	4	router	-0.0213	8734720	gemv_0_32_1_4_1
+248	2	router	0.0114	0	moe_route
+249	2	experts gate+up	0.0297	12236800	moe_gu_22_32_1_4
+250	1	experts down	0.0062	9216000	moe_down_20_4_2_4
+251	1	combine	0.0212	0	moe_combine_sh2
+252	1	hc	-0.0307	0	gr_norm2
+253	1	hc	0.0074	3525120	gr_down_q8_8_8
+254	1	hc	0.0193	3481600	gr_up_q8
+255	4	gdn dense	0.0736	44825600	gemv_8_16_1_4_1
+256	1	gdn other	-0.0180	0	gdn_step
+257	1	gdn dense	0.0253	16711680	gemv_8_32_1_8_2
+258	1	hc	0.0213	0	gr_norm2
+259	1	hc	-0.0270	3525120	gr_down_q8_8_8
+260	1	hc	0.0202	3481600	gr_up_q8
+261	4	router	0.0039	8734720	gemv_0_32_1_4_1
+262	2	router	0.0183	0	moe_route
+263	2	experts gate+up	0.0229	12236800	moe_gu_22_32_1_4
+264	1	experts down	0.0078	9216000	moe_down_20_4_2_4
+265	1	combine	0.0092	0	moe_combine_sh2
+266	1	hc	-0.0033	0	gr_norm2
+267	1	hc	0.0036	3525120	gr_down_q8_8_8
+268	1	hc	0.0047	3481600	gr_up_q8
+269	4	gdn dense	0.0497	44825600	gemv_8_16_1_4_1
+270	1	gdn other	0.0545	0	gdn_step
+271	1	gdn dense	0.0290	16711680	gemv_8_32_1_8_2
+272	1	hc	0.0004	0	gr_norm2
+273	1	hc	-0.0103	3525120	gr_down_q8_8_8
+274	1	hc	0.0106	3481600	gr_up_q8
+275	4	router	0.0054	8734720	gemv_0_32_1_4_1
+276	2	router	-0.0136	0	moe_route
+277	2	experts gate+up	0.0721	12236800	moe_gu_22_32_1_4
+278	1	experts down	-0.0173	9216000	moe_down_20_4_2_4
+279	1	combine	-0.0029	0	moe_combine_sh2
+280	1	hc	-0.0194	0	gr_norm2
+281	1	hc	0.0162	3525120	gr_down_q8_8_8
+282	1	hc	0.0025	3481600	gr_up_q8
+283	5	qsa dense	0.0403	39485440	gemv_8_16_1_4_1
+284	1	qsa other	0.0057	0	qsa_prep
+285	1	qsa other	0.0610	0	qsa_attn
+286	1	qsa other	0.0076	0	qsa_merge
+287	1	qsa dense	0.0194	16711680	gemv_8_32_1_8_2
+288	1	hc	-0.0001	0	gr_norm2
+289	1	hc	0.0108	3525120	gr_down_q8_8_8
+290	1	hc	0.0090	3481600	gr_up_q8
+291	4	router	0.0061	8734720	gemv_0_32_1_4_1
+292	2	router	0.0357	0	moe_route
+293	2	experts gate+up	0.0313	12236800	moe_gu_22_32_1_4
+294	1	experts down	-0.0113	9216000	moe_down_20_4_2_4
+295	1	combine	0.0300	0	moe_combine_sh2
+296	1	hc	-0.0474	0	gr_norm2
+297	1	hc	0.0288	3525120	gr_down_q8_8_8
+298	1	hc	-0.0091	3481600	gr_up_q8
+299	4	gdn dense	0.0745	44825600	gemv_8_16_1_4_1
+300	1	gdn other	0.0048	0	gdn_step
+301	1	gdn dense	0.0012	16711680	gemv_8_32_1_8_2
+302	1	hc	0.0207	0	gr_norm2
+303	1	hc	0.0041	3525120	gr_down_q8_8_8
+304	1	hc	-0.0012	3481600	gr_up_q8
+305	4	router	0.0193	8734720	gemv_0_32_1_4_1
+306	2	router	0.0081	0	moe_route
+307	2	experts gate+up	0.0222	12236800	moe_gu_22_32_1_4
+308	1	experts down	0.0159	9216000	moe_down_20_4_2_4
+309	1	combine	0.0006	0	moe_combine_sh2
+310	1	hc	-0.0149	0	gr_norm2
+311	1	hc	0.0260	3525120	gr_down_q8_8_8
+312	1	hc	-0.0049	3481600	gr_up_q8
+313	4	gdn dense	0.0753	44825600	gemv_8_16_1_4_1
+314	1	gdn other	0.0270	0	gdn_step
+315	1	gdn dense	0.0188	16711680	gemv_8_32_1_8_2
+316	1	hc	-0.0277	0	gr_norm2
+317	1	hc	0.0384	3525120	gr_down_q8_8_8
+318	1	hc	-0.0078	3481600	gr_up_q8
+319	4	router	0.0070	8734720	gemv_0_32_1_4_1
+320	2	router	-0.0149	0	moe_route
+321	2	experts gate+up	0.0202	12236800	moe_gu_22_32_1_4
+322	1	experts down	0.0308	9216000	moe_down_20_4_2_4
+323	1	combine	-0.0001	0	moe_combine_sh2
+324	1	hc	0.0103	0	gr_norm2
+325	1	hc	0.0036	3525120	gr_down_q8_8_8
+326	1	hc	-0.0060	3481600	gr_up_q8
+327	4	gdn dense	0.0611	44825600	gemv_8_16_1_4_1
+328	1	gdn other	0.0061	0	gdn_step
+329	1	gdn dense	0.0096	16711680	gemv_8_32_1_8_2
+330	1	hc	0.0154	0	gr_norm2
+331	1	hc	-0.0081	3525120	gr_down_q8_8_8
+332	1	hc	0.0086	3481600	gr_up_q8
+333	4	router	0.0073	8734720	gemv_0_32_1_4_1
+334	2	router	0.0128	0	moe_route
+335	2	experts gate+up	0.0271	12236800	moe_gu_22_32_1_4
+336	1	experts down	0.0406	9216000	moe_down_20_4_2_4
+337	1	combine	-0.0078	0	moe_combine_sh2
+338	1	hc	0.0163	0	gr_norm2
+339	1	hc	0.0392	3525120	gr_down_q8_8_8
+340	1	hc	-0.0283	3481600	gr_up_q8
+341	5	qsa dense	0.0125	39485440	gemv_8_16_1_4_1
+342	1	qsa other	0.0028	0	qsa_prep
+343	1	qsa other	0.0647	0	qsa_attn
+344	1	qsa other	0.0025	0	qsa_merge
+345	1	qsa dense	0.0339	16711680	gemv_8_32_1_8_2
+346	1	hc	-0.0226	0	gr_norm2
+347	1	hc	0.0118	3525120	gr_down_q8_8_8
+348	1	hc	0.0225	3481600	gr_up_q8
+349	4	router	0.0098	8734720	gemv_0_32_1_4_1
+350	2	router	-0.0021	0	moe_route
+351	2	experts gate+up	0.0508	12236800	moe_gu_22_32_1_4
+352	1	experts down	0.0102	9216000	moe_down_20_4_2_4
+353	1	combine	-0.0252	0	moe_combine_sh2
+354	1	hc	0.0220	0	gr_norm2
+355	1	hc	0.0184	3525120	gr_down_q8_8_8
+356	1	hc	0.0192	3481600	gr_up_q8
+357	4	gdn dense	-0.0048	44825600	gemv_8_16_1_4_1
+358	1	gdn other	0.0466	0	gdn_step
+359	1	gdn dense	-0.0031	16711680	gemv_8_32_1_8_2
+360	1	hc	0.0438	0	gr_norm2
+361	1	hc	0.0116	3525120	gr_down_q8_8_8
+362	1	hc	-0.0424	3481600	gr_up_q8
+363	4	router	0.0173	8734720	gemv_0_32_1_4_1
+364	2	router	0.0783	0	moe_route
+365	2	experts gate+up	-0.0094	12236800	moe_gu_22_32_1_4
+366	1	experts down	0.0173	9216000	moe_down_20_4_2_4
+367	1	combine	-0.0057	0	moe_combine_sh2
+368	1	hc	-0.0367	0	gr_norm2
+369	1	hc	0.0477	3525120	gr_down_q8_8_8
+370	1	hc	-0.0026	3481600	gr_up_q8
+371	4	gdn dense	0.0449	44825600	gemv_8_16_1_4_1
+372	1	gdn other	0.0286	0	gdn_step
+373	1	gdn dense	-0.0250	16711680	gemv_8_32_1_8_2
+374	1	hc	0.0333	0	gr_norm2
+375	1	hc	0.0569	3525120	gr_down_q8_8_8
+376	1	hc	-0.0566	3481600	gr_up_q8
+377	4	router	0.0239	8734720	gemv_0_32_1_4_1
+378	2	router	0.0455	0	moe_route
+379	2	experts gate+up	-0.0164	12236800	moe_gu_22_32_1_4
+380	1	experts down	0.0468	9216000	moe_down_20_4_2_4
+381	1	combine	0.0081	0	moe_combine_sh2
+382	1	hc	-0.0106	0	gr_norm2
+383	1	hc	0.0207	3525120	gr_down_q8_8_8
+384	1	hc	-0.0306	3481600	gr_up_q8
+385	4	gdn dense	0.0350	44825600	gemv_8_16_1_4_1
+386	1	gdn other	0.0892	0	gdn_step
+387	1	gdn dense	-0.0172	16711680	gemv_8_32_1_8_2
+388	1	hc	-0.0208	0	gr_norm2
+389	1	hc	0.0092	3525120	gr_down_q8_8_8
+390	1	hc	0.0103	3481600	gr_up_q8
+391	4	router	0.0084	8734720	gemv_0_32_1_4_1
+392	2	router	0.0448	0	moe_route
+393	2	experts gate+up	0.0204	12236800	moe_gu_22_32_1_4
+394	1	experts down	-0.0091	9216000	moe_down_20_4_2_4
+395	1	combine	0.0068	0	moe_combine_sh2
+396	1	hc	0.0524	0	gr_norm2
+397	1	hc	-0.0110	3525120	gr_down_q8_8_8
+398	1	hc	-0.0230	3481600	gr_up_q8
+399	5	qsa dense	0.0404	39485440	gemv_8_16_1_4_1
+400	1	qsa other	0.0775	0	qsa_prep
+401	1	qsa other	-0.0299	0	qsa_attn
+402	1	qsa other	0.0080	0	qsa_merge
+403	1	qsa dense	-0.0269	16711680	gemv_8_32_1_8_2
+404	1	hc	0.0051	0	gr_norm2
+405	1	hc	0.0174	3525120	gr_down_q8_8_8
+406	1	hc	0.0435	3481600	gr_up_q8
+407	4	router	-0.0141	8734720	gemv_0_32_1_4_1
+408	2	router	0.0483	0	moe_route
+409	2	experts gate+up	-0.0192	12236800	moe_gu_22_32_1_4
+410	1	experts down	0.0035	9216000	moe_down_20_4_2_4
+411	1	combine	0.0267	0	moe_combine_sh2
+412	1	hc	-0.0088	0	gr_norm2
+413	1	hc	-0.0120	3525120	gr_down_q8_8_8
+414	1	hc	0.0085	3481600	gr_up_q8
+415	4	gdn dense	0.0583	44825600	gemv_8_16_1_4_1
+416	1	gdn other	0.0057	0	gdn_step
+417	1	gdn dense	0.0520	16711680	gemv_8_32_1_8_2
+418	1	hc	-0.0285	0	gr_norm2
+419	1	hc	0.0043	3525120	gr_down_q8_8_8
+420	1	hc	0.0057	3481600	gr_up_q8
+421	4	router	0.0108	8734720	gemv_0_32_1_4_1
+422	2	router	0.0259	0	moe_route
+423	2	experts gate+up	0.0296	12236800	moe_gu_22_32_1_4
+424	1	experts down	0.0248	9216000	moe_down_20_4_2_4
+425	1	combine	0.0407	0	moe_combine_sh2
+426	1	hc	-0.0390	0	gr_norm2
+427	1	hc	-0.0005	3525120	gr_down_q8_8_8
+428	1	hc	0.0417	3481600	gr_up_q8
+429	4	gdn dense	0.0227	44825600	gemv_8_16_1_4_1
+430	1	gdn other	0.0366	0	gdn_step
+431	1	gdn dense	0.0134	16711680	gemv_8_32_1_8_2
+432	1	hc	-0.0083	0	gr_norm2
+433	1	hc	0.0162	3525120	gr_down_q8_8_8
+434	1	hc	-0.0022	3481600	gr_up_q8
+435	4	router	0.0254	8734720	gemv_0_32_1_4_1
+436	2	router	-0.0027	0	moe_route
+437	2	experts gate+up	0.0404	12236800	moe_gu_22_32_1_4
+438	1	experts down	0.0522	9216000	moe_down_20_4_2_4
+439	1	combine	-0.0220	0	moe_combine_sh2
+440	1	hc	0.0072	0	gr_norm2
+441	1	hc	-0.0459	3525120	gr_down_q8_8_8
+442	1	hc	0.0580	3481600	gr_up_q8
+443	4	gdn dense	0.0362	44825600	gemv_8_16_1_4_1
+444	1	gdn other	0.0379	0	gdn_step
+445	1	gdn dense	-0.0241	16711680	gemv_8_32_1_8_2
+446	1	hc	0.0137	0	gr_norm2
+447	1	hc	0.0388	3525120	gr_down_q8_8_8
+448	1	hc	-0.0067	3481600	gr_up_q8
+449	4	router	-0.0188	8734720	gemv_0_32_1_4_1
+450	2	router	0.0159	0	moe_route
+451	2	experts gate+up	0.0210	12236800	moe_gu_22_32_1_4
+452	1	experts down	0.0410	9216000	moe_down_20_4_2_4
+453	1	combine	-0.0577	0	moe_combine_sh2
+454	1	hc	-0.0028	0	gr_norm2
+455	1	hc	0.0160	3525120	gr_down_q8_8_8
+456	1	hc	0.0352	3481600	gr_up_q8
+457	5	qsa dense	0.0064	39485440	gemv_8_16_1_4_1
+458	1	qsa other	0.0036	0	qsa_prep
+459	1	qsa other	0.0443	0	qsa_attn
+460	1	qsa other	0.0552	0	qsa_merge
+461	1	qsa dense	0.0038	16711680	gemv_8_32_1_8_2
+462	1	hc	0.0019	0	gr_norm2
+463	1	hc	-0.0234	3525120	gr_down_q8_8_8
+464	1	hc	0.0046	3481600	gr_up_q8
+465	4	router	0.0886	8734720	gemv_0_32_1_4_1
+466	2	router	-0.0720	0	moe_route
+467	2	experts gate+up	0.0325	12236800	moe_gu_22_32_1_4
+468	1	experts down	0.0102	9216000	moe_down_20_4_2_4
+469	1	combine	0.0086	0	moe_combine_sh2
+470	1	hc	0.0506	0	gr_norm2
+471	1	hc	-0.0322	3525120	gr_down_q8_8_8
+472	1	hc	0.0081	3481600	gr_up_q8
+473	4	gdn dense	0.0873	44825600	gemv_8_16_1_4_1
+474	1	gdn other	-0.0184	0	gdn_step
+475	1	gdn dense	0.0317	16711680	gemv_8_32_1_8_2
+476	1	hc	-0.0056	0	gr_norm2
+477	1	hc	-0.0085	3525120	gr_down_q8_8_8
+478	1	hc	0.0390	3481600	gr_up_q8
+479	4	router	0.0029	8734720	gemv_0_32_1_4_1
+480	2	router	-0.0213	0	moe_route
+481	2	experts gate+up	0.0167	12236800	moe_gu_22_32_1_4
+482	1	experts down	0.0489	9216000	moe_down_20_4_2_4
+483	1	combine	0.0597	0	moe_combine_sh2
+484	1	hc	-0.0595	0	gr_norm2
+485	1	hc	-0.0115	3525120	gr_down_q8_8_8
+486	1	hc	0.0218	3481600	gr_up_q8
+487	4	gdn dense	0.0642	44825600	gemv_8_16_1_4_1
+488	1	gdn other	0.0146	0	gdn_step
+489	1	gdn dense	0.0171	16711680	gemv_8_32_1_8_2
+490	1	hc	0.0061	0	gr_norm2
+491	1	hc	-0.0309	3525120	gr_down_q8_8_8
+492	1	hc	0.0849	3481600	gr_up_q8
+493	4	router	-0.0511	8734720	gemv_0_32_1_4_1
+494	2	router	-0.0064	0	moe_route
+495	2	experts gate+up	0.0424	12236800	moe_gu_22_32_1_4
+496	1	experts down	-0.0075	9216000	moe_down_20_4_2_4
+497	1	combine	0.0008	0	moe_combine_sh2
+498	1	hc	0.0206	0	gr_norm2
+499	1	hc	0.0110	3525120	gr_down_q8_8_8
+500	1	hc	0.0113	3481600	gr_up_q8
+501	4	gdn dense	0.0671	44825600	gemv_8_16_1_4_1
+502	1	gdn other	0.0184	0	gdn_step
+503	1	gdn dense	0.0041	16711680	gemv_8_32_1_8_2
+504	1	hc	0.0188	0	gr_norm2
+505	1	hc	0.0281	3525120	gr_down_q8_8_8
+506	1	hc	-0.0096	3481600	gr_up_q8
+507	4	router	0.0065	8734720	gemv_0_32_1_4_1
+508	2	router	0.0093	0	moe_route
+509	2	experts gate+up	0.0260	12236800	moe_gu_22_32_1_4
+510	1	experts down	0.0429	9216000	moe_down_20_4_2_4
+511	1	combine	0.0031	0	moe_combine_sh2
+512	1	hc	-0.0570	0	gr_norm2
+513	1	hc	0.0706	3525120	gr_down_q8_8_8
+514	1	hc	-0.0621	3481600	gr_up_q8
+515	5	qsa dense	0.0795	39485440	gemv_8_16_1_4_1
+516	1	qsa other	0.1027	0	qsa_prep
+517	1	qsa other	-0.0582	0	qsa_attn
+518	1	qsa other	-0.0377	0	qsa_merge
+519	1	qsa dense	0.0206	16711680	gemv_8_32_1_8_2
+520	1	hc	0.0033	0	gr_norm2
+521	1	hc	0.0893	3525120	gr_down_q8_8_8
+522	1	hc	-0.0356	3481600	gr_up_q8
+523	4	router	0.0609	8734720	gemv_0_32_1_4_1
+524	2	router	-0.0859	0	moe_route
+525	2	experts gate+up	0.0575	12236800	moe_gu_22_32_1_4
+526	1	experts down	-0.0045	9216000	moe_down_20_4_2_4
+527	1	combine	0.0411	0	moe_combine_sh2
+528	1	hc	-0.0221	0	gr_norm2
+529	1	hc	0.0533	3525120	gr_down_q8_8_8
+530	1	hc	-0.0072	3481600	gr_up_q8
+531	4	gdn dense	0.0743	44825600	gemv_8_16_1_4_1
+532	1	gdn other	-0.0405	0	gdn_step
+533	1	gdn dense	0.0055	16711680	gemv_8_32_1_8_2
+534	1	hc	0.0242	0	gr_norm2
+535	1	hc	0.0027	3525120	gr_down_q8_8_8
+536	1	hc	-0.0275	3481600	gr_up_q8
+537	4	router	0.0274	8734720	gemv_0_32_1_4_1
+538	2	router	0.0429	0	moe_route
+539	2	experts gate+up	0.0323	12236800	moe_gu_22_32_1_4
+540	1	experts down	0.0345	9216000	moe_down_20_4_2_4
+541	1	combine	0.0373	0	moe_combine_sh2
+542	1	hc	-0.0814	0	gr_norm2
+543	1	hc	0.0763	3525120	gr_down_q8_8_8
+544	1	hc	-0.0942	3481600	gr_up_q8
+545	4	gdn dense	0.0985	44825600	gemv_8_16_1_4_1
+546	1	gdn other	0.0177	0	gdn_step
+547	1	gdn dense	0.0132	16711680	gemv_8_32_1_8_2
+548	1	hc	-0.0516	0	gr_norm2
+549	1	hc	0.0659	3525120	gr_down_q8_8_8
+550	1	hc	-0.0371	3481600	gr_up_q8
+551	4	router	0.0106	8734720	gemv_0_32_1_4_1
+552	2	router	0.0602	0	moe_route
+553	2	experts gate+up	0.0479	12236800	moe_gu_22_32_1_4
+554	1	experts down	0.0120	9216000	moe_down_20_4_2_4
+555	1	combine	0.0150	0	moe_combine_sh2
+556	1	hc	-0.0731	0	gr_norm2
+557	1	hc	0.0545	3525120	gr_down_q8_8_8
+558	1	hc	-0.0476	3481600	gr_up_q8
+559	4	gdn dense	0.0479	44825600	gemv_8_16_1_4_1
+560	1	gdn other	0.0119	0	gdn_step
+561	1	gdn dense	0.0953	16711680	gemv_8_32_1_8_2
+562	1	hc	-0.0193	0	gr_norm2
+563	1	hc	0.0429	3525120	gr_down_q8_8_8
+564	1	hc	-0.0138	3481600	gr_up_q8
+565	4	router	0.0111	8734720	gemv_0_32_1_4_1
+566	2	router	-0.0541	0	moe_route
+567	2	experts gate+up	0.0515	12236800	moe_gu_22_32_1_4
+568	1	experts down	0.0307	9216000	moe_down_20_4_2_4
+569	1	combine	0.0119	0	moe_combine_sh2
+570	1	hc	-0.0057	0	gr_norm2
+571	1	hc	-0.0041	3525120	gr_down_q8_8_8
+572	1	hc	0.0366	3481600	gr_up_q8
+573	5	qsa dense	-0.0064	39485440	gemv_8_16_1_4_1
+574	1	qsa other	0.1585	0	qsa_prep
+575	1	qsa other	-0.0551	0	qsa_attn
+576	1	qsa other	-0.0088	0	qsa_merge
+577	1	qsa dense	-0.0314	16711680	gemv_8_32_1_8_2
+578	1	hc	-0.0098	0	gr_norm2
+579	1	hc	0.0696	3525120	gr_down_q8_8_8
+580	1	hc	-0.0045	3481600	gr_up_q8
+581	4	router	-0.0114	8734720	gemv_0_32_1_4_1
+582	2	router	0.0242	0	moe_route
+583	2	experts gate+up	0.0622	12236800	moe_gu_22_32_1_4
+584	1	experts down	-0.0143	9216000	moe_down_20_4_2_4
+585	1	combine	0.0410	0	moe_combine_sh2
+586	1	hc	-0.0599	0	gr_norm2
+587	1	hc	-0.0122	3525120	gr_down_q8_8_8
+588	1	hc	0.0124	3481600	gr_up_q8
+589	4	gdn dense	0.0375	44825600	gemv_8_16_1_4_1
+590	1	gdn other	0.0538	0	gdn_step
+591	1	gdn dense	0.0305	16711680	gemv_8_32_1_8_2
+592	1	hc	0.0377	0	gr_norm2
+593	1	hc	-0.0346	3525120	gr_down_q8_8_8
+594	1	hc	0.0500	3481600	gr_up_q8
+595	4	router	-0.0659	8734720	gemv_0_32_1_4_1
+596	2	router	0.0496	0	moe_route
+597	2	experts gate+up	0.0255	15820800	moe_gu_21_32_1_4
+598	1	experts down	-0.0165	9216000	moe_down_20_4_2_4
+599	1	combine	0.0539	0	moe_combine_sh2
+600	1	hc	-0.0118	0	gr_norm2
+601	1	hc	-0.0242	3525120	gr_down_q8_8_8
+602	1	hc	0.0646	3481600	gr_up_q8
+603	4	gdn dense	0.0453	44825600	gemv_8_16_1_4_1
+604	1	gdn other	-0.0242	0	gdn_step
+605	1	gdn dense	0.0951	16711680	gemv_8_32_1_8_2
+606	1	hc	-0.1008	0	gr_norm2
+607	1	hc	-0.0097	3525120	gr_down_q8_8_8
+608	1	hc	0.0668	3481600	gr_up_q8
+609	4	router	0.0049	8734720	gemv_0_32_1_4_1
+610	2	router	-0.0365	0	moe_route
+611	2	experts gate+up	0.0739	15820800	moe_gu_21_32_1_4
+612	1	experts down	0.0188	9216000	moe_down_20_4_2_4
+613	1	combine	0.0264	0	moe_combine_sh2
+614	1	hc	-0.0556	0	gr_norm2
+615	1	hc	0.0435	3525120	gr_down_q8_8_8
+616	1	hc	0.0198	3481600	gr_up_q8
+617	4	gdn dense	-0.0223	44825600	gemv_8_16_1_4_1
+618	1	gdn other	0.0363	0	gdn_step
+619	1	gdn dense	0.0782	16711680	gemv_8_32_1_8_2
+620	1	hc	-0.0314	0	gr_norm2
+621	1	hc	0.0120	3525120	gr_down_q8_8_8
+622	1	hc	0.0166	3481600	gr_up_q8
+623	4	router	-0.0261	8734720	gemv_0_32_1_4_1
+624	2	router	0.0810	0	moe_route
+625	2	experts gate+up	-0.0405	15820800	moe_gu_21_32_1_4
+626	1	experts down	0.0881	9216000	moe_down_20_4_2_4
+627	1	combine	-0.0614	0	moe_combine_sh2
+628	1	hc	0.0222	0	gr_norm2
+629	1	hc	-0.0362	3525120	gr_down_q8_8_8
+630	1	hc	0.0491	3481600	gr_up_q8
+631	5	qsa dense	0.0233	39485440	gemv_8_16_1_4_1
+632	1	qsa other	0.0216	0	qsa_prep
+633	1	qsa other	0.0464	0	qsa_attn
+634	1	qsa other	0.0284	0	qsa_merge
+635	1	qsa dense	-0.0638	16711680	gemv_8_32_1_8_2
+636	1	hc	0.0751	0	gr_norm2
+637	1	hc	0.0016	3525120	gr_down_q8_8_8
+638	1	hc	0.0192	3481600	gr_up_q8
+639	4	router	0.0097	8734720	gemv_0_32_1_4_1
+640	2	router	0.0083	0	moe_route
+641	2	experts gate+up	-0.0382	15820800	moe_gu_21_32_1_4
+642	1	experts down	0.0124	9216000	moe_down_20_4_2_4
+643	1	combine	0.0819	0	moe_combine_sh2
+644	1	hc	0.0138	0	gr_norm2
+645	1	hc	0.0182	3525120	gr_down_q8_8_8
+646	1	hc	-0.0069	3481600	gr_up_q8
+647	4	gdn dense	-0.0028	44825600	gemv_8_16_1_4_1
+648	1	gdn other	0.0284	0	gdn_step
+649	1	gdn dense	-0.0392	16711680	gemv_8_32_1_8_2
+650	1	hc	0.0013	0	gr_norm2
+651	1	hc	0.0107	3525120	gr_down_q8_8_8
+652	1	hc	0.0858	3481600	gr_up_q8
+653	4	router	-0.0281	8734720	gemv_0_32_1_4_1
+654	2	router	0.0175	0	moe_route
+655	2	experts gate+up	0.0287	15820800	moe_gu_21_32_1_4
+656	1	experts down	0.0269	9216000	moe_down_20_4_2_4
+657	1	combine	-0.0015	0	moe_combine_sh2
+658	1	hc	-0.0296	0	gr_norm2
+659	1	hc	0.0307	3525120	gr_down_q8_8_8
+660	1	hc	-0.0280	3481600	gr_up_q8
+661	4	gdn dense	0.0359	44825600	gemv_8_16_1_4_1
+662	1	gdn other	0.0172	0	gdn_step
+663	1	gdn dense	0.0802	16711680	gemv_8_32_1_8_2
+664	1	hc	-0.0073	0	gr_norm2
+665	1	hc	0.0326	3525120	gr_down_q8_8_8
+666	1	hc	-0.0277	3481600	gr_up_q8
+667	4	router	-0.0317	8734720	gemv_0_32_1_4_1
+668	2	router	0.0011	0	moe_route
+669	2	experts gate+up	0.0500	15820800	moe_gu_21_32_1_4
+670	1	experts down	0.0447	9216000	moe_down_20_4_2_4
+671	1	combine	0.0231	0	moe_combine_sh2
+672	1	hc	-0.0108	0	gr_norm2
+673	1	hc	0.0345	3525120	gr_down_q8_8_8
+674	1	hc	-0.0071	3481600	gr_up_q8
+675	4	gdn dense	0.0272	44825600	gemv_8_16_1_4_1
+676	1	gdn other	-0.0281	0	gdn_step
+677	1	gdn dense	0.0494	16711680	gemv_8_32_1_8_2
+678	1	hc	0.0082	0	gr_norm2
+679	1	hc	-0.0455	3525120	gr_down_q8_8_8
+680	1	hc	0.0184	3481600	gr_up_q8
+681	4	router	0.0151	8734720	gemv_0_32_1_4_1
+682	2	router	0.0799	0	moe_route
+683	2	experts gate+up	0.0512	15820800	moe_gu_21_32_1_4
+684	1	experts down	-0.0446	9216000	moe_down_20_4_2_4
+685	1	combine	0.1320	0	moe_combine_sh2
+686	1	hc	-0.1749	0	gr_norm2
+687	1	hc	0.0131	3525120	gr_down_q8_8_8
+688	1	hc	0.0036	3481600	gr_up_q8
+689	5	qsa dense	0.0420	39485440	gemv_8_16_1_4_1
+690	1	qsa other	0.1287	0	qsa_prep
+691	1	qsa other	-0.0059	0	qsa_attn
+692	1	qsa other	0.0078	0	qsa_merge
+693	1	qsa dense	-0.0086	16711680	gemv_8_32_1_8_2
+694	1	hc	0.0049	0	gr_norm2
+695	1	hc	0.0301	3525120	gr_down_q8_8_8
+696	1	hc	0.0028	3481600	gr_up_q8
+697	4	router	-0.0056	8734720	gemv_0_32_1_4_1
+698	2	router	0.0170	0	moe_route
+699	2	experts gate+up	0.0210	15820800	moe_gu_21_32_1_4
+700	1	experts down	0.0071	9216000	moe_down_20_4_2_4
+701	1	combine	0.0032	0	moe_combine_sh2
+702	1	hc	0.0136	0	gr_norm2
+703	1	hc	-0.0113	6963200	gr_down_q8_8_8
+704	1	hc	-0.0216	3481600	gr_up_q8
+705	1	lm head	0.7357	675430400	gemv_8_16_1_4_1
+706	1	lm head (argmax)	-0.0454	0	argmax_part
+707	1	lm head (argmax)	-0.0052	0	argmax_final

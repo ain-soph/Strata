@@ -1,0 +1,84 @@
+kind	what	dispatches_removed	barriers_removed	base_ms	variant_ms	saved_ms	saved_pct
+none	all barriers removed	0	612	12.8749	9.4486	3.4263	26.61
+fuse	hc: gr_down + gr_up join gr_norm2's group	0	194	12.8781	12.0548	0.8233	6.39
+fuse	router: moe_route joins the router gemv's group	0	48	12.8421	12.5478	0.2943	2.29
+fuse	experts: moe_down joins moe_gu's group	0	0	12.8671	12.8629	0.0042	0.03
+fuse	hc + router + experts above together	0	242	12.8728	11.7553	1.1176	8.68
+drop part	combine	48	48	12.8826	12.7166	0.1660	1.29
+nobar part	combine	0	48	12.8572	12.7197	0.1375	1.07
+drop part	experts down	48	48	12.8731	11.7295	1.1437	8.88
+nobar part	experts down	0	0	12.8896	12.8960	-0.0064	-0.05
+drop part	experts gate+up	48	0	12.9013	11.2143	1.6869	13.08
+nobar part	experts gate+up	0	0	12.9212	12.9177	0.0035	0.03
+drop part	gdn dense	180	72	12.8978	9.9222	2.9756	23.07
+nobar part	gdn dense	0	72	12.8819	12.5603	0.3216	2.50
+drop part	gdn other	72	37	12.8980	12.1741	0.7240	5.61
+nobar part	gdn other	0	36	12.8990	12.7810	0.1180	0.91
+drop part	hc	292	292	12.9005	10.4326	2.4678	19.13
+nobar part	hc	0	292	12.9160	11.8165	1.0995	8.51
+drop part	lm head	1	1	12.9038	12.1954	0.7084	5.49
+nobar part	lm head	0	1	12.8920	12.8923	-0.0002	-0.00
+drop part	lm head (argmax)	2	2	12.8863	12.8687	0.0176	0.14
+nobar part	lm head (argmax)	0	2	12.8997	12.8934	0.0064	0.05
+drop part	ple	6	4	12.9016	12.8259	0.0757	0.59
+nobar part	ple	0	4	12.8977	12.8824	0.0154	0.12
+drop part	qsa dense	72	24	12.8855	11.9789	0.9066	7.04
+nobar part	qsa dense	0	24	12.8754	12.7672	0.1082	0.84
+drop part	qsa other	36	36	12.8847	12.2435	0.6412	4.98
+nobar part	qsa other	0	36	12.8743	12.6699	0.2044	1.59
+drop part	router	96	0	12.8802	12.2830	0.5973	4.64
+nobar part	router	0	96	12.8995	12.2775	0.6220	4.82
+drop part	shared	240	0	12.9138	12.5959	0.3179	2.46
+nobar part	shared	0	0	12.9219	12.9100	0.0120	0.09
+drop part	xprep	1	1	12.9207	12.9142	0.0065	0.05
+nobar part	xprep	0	1	12.9265	12.9109	0.0157	0.12
+drop pipe	argmax_final	1	1	12.9176	12.9111	0.0065	0.05
+nobar pipe	argmax_final	0	1	12.9102	12.9072	0.0031	0.02
+drop pipe	argmax_part	1	1	12.9263	12.9120	0.0143	0.11
+nobar pipe	argmax_part	0	1	12.9147	12.9083	0.0064	0.05
+drop pipe	gdn_step	72	37	12.8983	12.1995	0.6987	5.42
+nobar pipe	gdn_step	0	36	12.8926	12.7903	0.1024	0.79
+drop pipe	gemv_0_32_1_4_1	96	0	12.8903	12.8465	0.0438	0.34
+nobar pipe	gemv_0_32_1_4_1	0	48	12.8882	12.5974	0.2908	2.26
+drop pipe	gemv_30_32_1_4_1	24	0	12.8870	12.8635	0.0235	0.18
+nobar pipe	gemv_30_32_1_4_1	0	0	12.8905	12.8766	0.0139	0.11
+drop pipe	gemv_8_16_1_4_1	87	2	12.8822	9.9930	2.8892	22.43
+nobar pipe	gemv_8_16_1_4_1	0	50	12.8899	12.5546	0.3352	2.60
+drop pipe	gemv_8_32_1_4_1	192	0	12.8914	12.5431	0.3483	2.70
+nobar pipe	gemv_8_32_1_4_1	0	0	12.8858	12.8801	0.0057	0.04
+drop pipe	gemv_8_32_1_8_2	48	48	12.8850	11.5601	1.3250	10.28
+nobar pipe	gemv_8_32_1_8_2	0	48	12.8790	12.7447	0.1343	1.04
+drop pipe	gemv_8_8_1_4_1	48	0	12.8648	12.8097	0.0551	0.43
+nobar pipe	gemv_8_8_1_4_1	0	0	12.8753	12.8729	0.0023	0.02
+drop pipe	gr_down_q8_8_8	97	97	12.8745	11.7524	1.1221	8.72
+nobar pipe	gr_down_q8_8_8	0	97	12.8698	12.5408	0.3290	2.56
+drop pipe	gr_norm2	98	98	12.8629	12.4772	0.3857	3.00
+nobar pipe	gr_norm2	0	98	12.8647	12.5124	0.3523	2.74
+drop pipe	gr_up_q8	97	97	12.8866	12.0183	0.8683	6.74
+nobar pipe	gr_up_q8	0	97	12.8787	12.4447	0.4341	3.37
+drop pipe	moe_combine_sh2	48	48	12.8837	12.7266	0.1571	1.22
+nobar pipe	moe_combine_sh2	0	48	12.8865	12.7384	0.1481	1.15
+drop pipe	moe_down_20_4_2_4	48	48	12.8906	11.7321	1.1585	8.99
+nobar pipe	moe_down_20_4_2_4	0	0	12.9014	12.8960	0.0053	0.04
+drop pipe	moe_gu_21_32_1_4	12	0	12.8866	12.4422	0.4444	3.45
+nobar pipe	moe_gu_21_32_1_4	0	0	12.8982	12.8999	-0.0017	-0.01
+drop pipe	moe_gu_22_32_1_4	36	0	12.8900	11.6680	1.2220	9.48
+nobar pipe	moe_gu_22_32_1_4	0	0	12.8891	12.8733	0.0158	0.12
+drop pipe	moe_route	48	0	12.8936	12.4231	0.4705	3.65
+nobar pipe	moe_route	0	48	12.8892	12.6072	0.2820	2.19
+drop pipe	ple_conv_add	1	1	12.8985	12.8934	0.0051	0.04
+nobar pipe	ple_conv_add	0	1	12.8979	12.8872	0.0106	0.08
+drop pipe	ple_gate_norm	1	1	12.8963	12.8822	0.0141	0.11
+nobar pipe	ple_gate_norm	0	1	12.9097	12.8876	0.0221	0.17
+drop pipe	ple_gnorm	2	1	12.9102	12.8855	0.0247	0.19
+nobar pipe	ple_gnorm	0	1	12.9123	12.8999	0.0124	0.10
+drop pipe	qsa_attn	12	12	12.9109	12.3920	0.5189	4.02
+nobar pipe	qsa_attn	0	12	12.9043	12.8415	0.0627	0.49
+drop pipe	qsa_merge	12	12	12.9011	12.8614	0.0397	0.31
+nobar pipe	qsa_merge	0	12	12.8874	12.8296	0.0578	0.45
+drop pipe	qsa_prep	12	12	12.8764	12.8192	0.0572	0.44
+nobar pipe	qsa_prep	0	12	12.8742	12.7992	0.0750	0.58
+drop pipe	swiglu_prep	48	0	12.8832	12.8886	-0.0054	-0.04
+nobar pipe	swiglu_prep	0	0	12.8882	12.8891	-0.0009	-0.01
+drop pipe	xprep	1	1	12.8807	12.8723	0.0084	0.07
+nobar pipe	xprep	0	1	12.8769	12.8695	0.0074	0.06

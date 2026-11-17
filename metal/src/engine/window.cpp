@@ -497,6 +497,13 @@ private:
     // share a barrier are inside the numbers.  Also the weight bytes read per part (dense from the tensor table, experts from the routed ids of
     // every layer: the distinct experts) and the GB/s each part reaches.  STRATA_METAL_STEPPROF_OUT=path: one line per group.
     void stepprof(const std::vector<mtl::Dispatch>& ds, int Tn);
+    // STRATA_METAL_FUSEPROF=path with STRATA_METAL_STEPPROF=T (measurement, branch decode-fusion): the ceiling of fusing kernels,
+    // before writing any.  The same window's dispatch list is run with a part (or one pipeline) left out, or with the barriers in
+    // front of its dispatches removed, each variant interleaved with the unchanged list (15 pairs, medians, so the GPU's heat
+    // cancels).  Left out = the most that part's time could shrink; no barriers = what its synchronization costs.  The outputs
+    // are wrong by design (profiling only); a dispatch whose grid comes from a GPU buffer always keeps its barrier.
+    void fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<const mtl::Pipeline*, std::string>& pname,
+                  const std::vector<std::string>& part);
     void fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp);
     // the encoded window per (T, head, hp_): built once, then only the positions are patched (the host's encode cost)
     struct Cached {
@@ -1868,6 +1875,7 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
         }
         info[i] = {part, wb};
     }
+    if (std::getenv("STRATA_METAL_FUSEPROF")) fuseprof(ds, Tn, pname, [&] { std::vector<std::string> v; for (const auto& x : info) v.push_back(x.part); return v; }());
     // barrier groups
     std::vector<size_t> gs;
     for (size_t i = 0; i < n; ++i) if (i == 0 || ds[i].barrier) gs.push_back(i);
@@ -1952,6 +1960,68 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
     std::string ds_str;
     for (size_t i = 0; i < distinct.size(); ++i) ds_str += std::to_string(distinct[i]) + (i + 1 < distinct.size() ? "," : "");
     std::fprintf(stderr, "strata metal stepprof: distinct experts per layer: %s\n", ds_str.c_str());
+    std::fflush(stderr);
+}
+
+void Window::fuseprof(const std::vector<mtl::Dispatch>& ds, int Tn, std::map<const mtl::Pipeline*, std::string>& pname,
+                      const std::vector<std::string>& part) {
+    const size_t n = ds.size();
+    std::vector<std::string> pl(n);
+    for (size_t i = 0; i < n; ++i) pl[i] = pname.count(ds[i].p) ? pname[ds[i].p] : "?";
+    auto starts = [&](size_t i, const char* pre) { return pl[i].rfind(pre, 0) == 0; };
+    // keep(i): the dispatch stays; bar(i): it keeps its barrier.  A dropped dispatch's barrier moves to the next one kept.
+    auto variant = [&](const std::function<bool(size_t)>& keep, const std::function<bool(size_t)>& bar) {
+        std::vector<mtl::Dispatch> v;
+        bool carry = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!keep(i)) { carry = carry || ds[i].barrier; continue; }
+            mtl::Dispatch d = ds[i];
+            d.barrier = ((ds[i].barrier || carry) && bar(i)) || d.indirect != nullptr;
+            carry = false;
+            v.push_back(std::move(d));
+        }
+        return v;
+    };
+    for (int i = 0; i < 40; ++i) cx_->run_graph(ds);   // clocks up
+    struct Res { std::string kind, what; size_t disp = 0, bars = 0; double base = 0, ms = 0; };
+    std::vector<Res> res;
+    auto bars = [](const std::vector<mtl::Dispatch>& v) { size_t b = 0; for (size_t i = 1; i < v.size(); ++i) b += v[i].barrier; return b; };
+    const size_t base_bars = bars(ds);
+    auto run = [&](const std::string& kind, const std::string& what, const std::vector<mtl::Dispatch>& v) {
+        std::vector<double> a, b;
+        for (int r = 0; r < 15; ++r) { a.push_back(1000.0 * cx_->run_graph(ds)); b.push_back(1000.0 * cx_->run_graph(v)); }
+        std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+        res.push_back({kind, what, n - v.size(), base_bars - bars(v), a[7], b[7]});
+    };
+    auto all = [](size_t) { return true; };
+    run("none", "all barriers removed", variant(all, [](size_t i) { return i == 0; }));
+    // the fusions in question: hc (gr_norm2 -> gr_down_q8 -> gr_up_q8 as one kernel per sub-layer), the router (its gemv and moe_route)
+    run("fuse", "hc: gr_down + gr_up join gr_norm2's group", variant(all, [&](size_t i) { return !(starts(i, "gr_down") || starts(i, "gr_up")); }));
+    run("fuse", "router: moe_route joins the router gemv's group", variant(all, [&](size_t i) { return !starts(i, "moe_route"); }));
+    run("fuse", "experts: moe_down joins moe_gu's group", variant(all, [&](size_t i) { return !starts(i, "moe_down"); }));
+    run("fuse", "hc + router + experts above together", variant(all, [&](size_t i) {
+        return !(starts(i, "gr_down") || starts(i, "gr_up") || starts(i, "moe_route") || starts(i, "moe_down")); }));
+    std::set<std::string> parts(part.begin(), part.end()), pipes(pl.begin(), pl.end());
+    for (const auto& q : parts) {
+        run("drop part", q, variant([&](size_t i) { return part[i] != q; }, all));
+        run("nobar part", q, variant(all, [&](size_t i) { return part[i] != q; }));
+    }
+    for (const auto& q : pipes) {
+        run("drop pipe", q, variant([&](size_t i) { return pl[i] != q; }, all));
+        run("nobar pipe", q, variant(all, [&](size_t i) { return pl[i] != q; }));
+    }
+    std::fprintf(stderr, "strata metal fuseprof: window T%d, %zu dispatches, %zu barriers; variant time vs the unchanged list (15 interleaved pairs, medians)\n",
+                 Tn, n, base_bars);
+    FILE* of = std::fopen(std::getenv("STRATA_METAL_FUSEPROF"), "w");
+    if (of) std::fprintf(of, "kind\twhat\tdispatches_removed\tbarriers_removed\tbase_ms\tvariant_ms\tsaved_ms\tsaved_pct\n");
+    for (const auto& r : res) {
+        const double sv = r.base - r.ms;
+        if (of) std::fprintf(of, "%s\t%s\t%zu\t%zu\t%.4f\t%.4f\t%.4f\t%.2f\n", r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
+        if (r.kind == "none" || r.kind == "fuse" || r.kind.find("part") != std::string::npos)
+            std::fprintf(stderr, "strata metal fuseprof: %-10s %-46s -%4zu disp -%4zu bars  %7.3f -> %7.3f ms  saves %6.3f ms (%5.1f%%)\n",
+                         r.kind.c_str(), r.what.c_str(), r.disp, r.bars, r.base, r.ms, sv, 100.0 * sv / r.base);
+    }
+    if (of) std::fclose(of);
     std::fflush(stderr);
 }
 

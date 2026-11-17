@@ -1,3 +1,13 @@
+> **ain-soph fork (`serving` branch, on upstream v0.2.13).** Changes for a long-running Mac server (M5 Ultra, 96 GB):
+> - **Metal `--prefill auto` overlaps the prompt's host rows with the GPU.** Upstream, auto takes the CUDA fallback for
+>   "no expert-cache slot to lend" (1024 tokens a call), but the Metal prompt path never borrows slots: every call was a
+>   single Metal chunk, so the next chunk's embedding + PLE rows (the hostpipe) were computed on the CPU while the GPU
+>   waited (~76% busy). Auto on Metal now hands each call 4 chunks of 1024 rows (`STRATA_METAL_PROMPT_CHUNK` still sets
+>   the chunk), keeping the same buffers. Qwen3.8-Flash-Next AD-4.27, resident, `--batch 2`, MTP: prefill 1,854 -> 2,014
+>   tok/s at 26K tokens (+9-18% across runs) and 1,999 -> 2,225 at 116K (+11%); peak memory, decode (117 / 74 tok/s at
+>   1 / 2 streams) and the temp-0 output are unchanged. Before this, the same speed needed
+>   `--prefill 4096` + `STRATA_METAL_PROMPT_CHUNK=1024`. Code: `prompt_chunk_for_auto` (metal/src/engine/window.cpp).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

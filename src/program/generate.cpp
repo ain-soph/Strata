@@ -158,6 +158,7 @@
 namespace strata::metal_engine {
 void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
+int64_t prompt_chunk_for_auto();   // metal/src/engine/window.cpp: --prefill auto's chunk (4 Metal prompt chunks a call)
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
@@ -11050,7 +11051,11 @@ int main(int argc, char** argv) {
                 borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
                 borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
             } else if (o.prefill_auto) {
+#if defined(STRATA_GPU_METAL)
+                o.prefill_chunk = strata::metal_engine::prompt_chunk_for_auto();   // Metal never borrows: hostpipe-sized calls
+#else
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
+#endif
             } else if (pf_parts.size() > 1) {
                 // An explicit chunk no stage can lend in full.  main falls back to the prompt path's own buffers
                 // here and so do we, rather than refusing to start - but say what every stage has, because a split
@@ -11065,7 +11070,11 @@ int main(int argc, char** argv) {
                                  (long long) part_slots(p, o.prefill_chunk));
             }
         } else if (o.prefill_auto && d_res == nullptr) {
+#if defined(STRATA_GPU_METAL)
+            o.prefill_chunk = strata::metal_engine::prompt_chunk_for_auto();
+#else
             o.prefill_chunk = 1024;       // #85: no expert cache at all (a full 8 GB card): small buffers of its own
+#endif
         }
         if (o.prefill_head_alias) {
             for (PfPart& p : pf_parts) {

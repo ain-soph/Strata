@@ -104,6 +104,7 @@ static bool gdn_fused_inputs(const std::string& device) {
 namespace {
 
 int g_slot_cap = 0;   // --batch N: the window keeps N + 1 sequences' running states side by side (set_batch_slots)
+int g_prompt_chunk_auto = 0;   // --prefill auto: the Metal prompt chunk's default (prompt_chunk_for_auto), else 0 (2048)
 
 // Q4-KQ: the kernel sources define STRATA_KQ_DOWN to instantiate the K-quant / IQ4_XS / IQ3_S down experts (moe.metal, moe_mm.metal).
 // The host asks for them only when a layer's down tensor has one of those types, so a Flash-Next set (Q5_1 / Q5_0 / Q8_0 / IQ4_NL / Q2_0
@@ -3446,6 +3447,19 @@ void window_register(void* w);
 bool mtp_load_pending(Window* w, std::string& err);
 void set_model_shard(const char* shard1) { g_shard1 = shard1 ? shard1 : ""; }
 void set_batch_slots(int n) { g_slot_cap = n > 0 ? std::min(n, 8) : 0; }
+// --prefill auto (generate.cpp).  The Metal prompt path never borrows expert-cache slots, but auto took the CUDA fallback for
+// "nothing lendable" (1024 tokens a call): every prompt() call was one Metal chunk, so the next chunk's embedding and PLE rows
+// (the hostpipe) never ran beside the GPU.  Auto keeps the buffers it always had (1024 rows, or STRATA_METAL_PROMPT_CHUNK) and
+// hands each call 4 of them.  M5 Ultra, Flash-Next AD-4.27, resident, --batch 2: prefill 1,854 -> 2,193 tok/s at 26K and
+// 1,999 -> 2,222 at 116K, the same peak memory, decode unchanged.
+int64_t prompt_chunk_for_auto() {
+    const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK");
+    g_prompt_chunk_auto = 1024;
+    const int c = std::max(64, std::min(8192, e ? std::atoi(e) : g_prompt_chunk_auto));
+    std::fprintf(stderr, "strata metal: --prefill auto: %d-token calls of %d-row prompt chunks (the next chunk's host rows "
+                         "beside the GPU)\n", 4 * c, c);
+    return 4 * (int64_t) c;
+}
 
 // The draft vocabulary the build ships (data/draft_vocab.bin beside the build, else the compiled-in data folder): what a DFlash2-alone start without <mtp>/draft_vocab.bin
 // uses (generate.cpp), and what Window::df2_bind falls back to.  STRATA_METAL_DRAFT_VOCAB names another file, or "full" for the whole head.

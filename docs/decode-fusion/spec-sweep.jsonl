@@ -1,0 +1,16 @@
+{"spec": 3, "min_p": 0.5, "order": 0, "story": 117.7, "code": 157.3, "json": 157.4, "zh": 137.5, "all": 140.5, "accept": 0.74}
+{"spec": 2, "min_p": 0.3, "order": 1, "story": 118.4, "code": 134.1, "json": 141.2, "zh": 128.8, "all": 130.1, "accept": 0.782}
+{"spec": 2, "min_p": 0.5, "order": 2, "story": 117.8, "code": 134.0, "json": 135.4, "zh": 128.1, "all": 128.4, "accept": 0.823}
+{"spec": 2, "min_p": 0.7, "order": 3, "story": 114.3, "code": 132.7, "json": 136.0, "zh": 126.7, "all": 126.9, "accept": 0.868}
+{"spec": 3, "min_p": 0.3, "order": 4, "story": 116.7, "code": 155.6, "json": 160.1, "zh": 136.4, "all": 140.0, "accept": 0.674}
+{"spec": 3, "min_p": 0.7, "order": 5, "story": 113.4, "code": 156.0, "json": 153.6, "zh": 133.4, "all": 136.8, "accept": 0.818}
+{"spec": 4, "min_p": 0.3, "order": 6, "story": 107.4, "code": 157.7, "json": 159.0, "zh": 131.9, "all": 135.5, "accept": 0.577}
+{"spec": 4, "min_p": 0.5, "order": 7, "story": 110.1, "code": 158.3, "json": 160.4, "zh": 135.7, "all": 137.9, "accept": 0.665}
+{"spec": 4, "min_p": 0.7, "order": 8, "story": 108.1, "code": 156.9, "json": 155.6, "zh": 134.6, "all": 135.7, "accept": 0.749}
+{"spec": 5, "min_p": 0.3, "order": 9, "story": 98.2, "code": 156.8, "json": 167.9, "zh": 124.1, "all": 130.8, "accept": 0.525}
+{"spec": 5, "min_p": 0.5, "order": 10, "story": 104.4, "code": 158.2, "json": 161.7, "zh": 129.6, "all": 134.2, "accept": 0.615}
+{"spec": 5, "min_p": 0.7, "order": 11, "story": 105.1, "code": 159.8, "json": 165.4, "zh": 131.5, "all": 135.9, "accept": 0.728}
+{"spec": 6, "min_p": 0.3, "order": 12, "story": 90.1, "code": 142.8, "json": 154.6, "zh": 112.9, "all": 119.7, "accept": 0.456}
+{"spec": 6, "min_p": 0.5, "order": 13, "story": 98.2, "code": 149.8, "json": 155.0, "zh": 122.5, "all": 127.1, "accept": 0.57}
+{"spec": 6, "min_p": 0.7, "order": 14, "story": 100.0, "code": 155.3, "json": 162.6, "zh": 126.4, "all": 131.1, "accept": 0.706}
+{"spec": 3, "min_p": 0.5, "order": 15, "story": 117.9, "code": 157.5, "json": 157.3, "zh": 137.6, "all": 140.6, "accept": 0.74}

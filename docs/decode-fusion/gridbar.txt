@@ -1,0 +1,7 @@
+device Apple M5 Ultra: 96 phases of 4.5 MiB
+dispatch per phase,   40 x 1024 threads:    8.97 us a phase   526.0 GB/s
+dispatch per phase,  160 x 1024 threads:    6.53 us a phase   723.0 GB/s
+dispatch per phase,  640 x 1024 threads:    6.80 us a phase   693.7 GB/s
+grid barrier,         10 x 1024 threads:   14.53 us a phase   324.7 GB/s  stale flags seen: 40437
+grid barrier,         20 x 1024 threads:   30.68 us a phase   153.8 GB/s  stale flags seen: 165001
+grid barrier,         40 x 1024 threads:   19.92 us a phase   236.9 GB/s  stale flags seen: 686410

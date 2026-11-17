@@ -71,6 +71,32 @@ removing barriers without redundant work: a small tail step done by the last thr
 (a device atomic counter + device-scope fences, no spinning), e.g. moe_route after the router GEMV (~0.2 ms) and
 moe_combine after moe_down (~0.1 ms): ~3% together.
 
+## Beyond fusion: speculation, expert tiles, grid barriers (all negative)
+
+**MTP window** (`spec-sweep.jsonl`): the deployed engine under `--spec 2..6` x `--spec-min-p 0.3/0.5/0.7`, four texts
+(story, code, JSON, Chinese), temp 0, 400 tokens each, the engine's own timings; the shipped 3 / 0.5 first and last.
+
+| spec | min-p 0.3 | 0.5 | 0.7 |
+|---|---|---|---|
+| 2 | 130.1 | 128.4 | 126.9 |
+| 3 | 140.0 | **140.5 / 140.6** (shipped, first / last) | 136.8 |
+| 4 | 135.5 | 137.9 | 135.7 |
+| 5 | 130.8 | 134.2 | 135.9 |
+| 6 | 119.7 | 127.1 | 131.1 |
+
+(tok/s over all four texts; JSON alone reaches 168 at 5 / 0.3 but story and Chinese lose more.) The shipped setting is best.
+
+**Expert tiles** (`expert-sweep-*.txt`, `expert_parity --bench --sweep`, synthetic routing): on the Ultra the gate/up
+16,1,4 and the down 4,1,4 beat the shipped 32,1,4 / 4,2,4 by 1-3 us a layer at every ntok. On the real model
+(`tiles-ab.jsonl`, `STRATA_METAL_MOE_GU=16,1,4 STRATA_METAL_MOE_DN=4,1,4`, A B A B) they are slower: 139.2 against
+140.7 tok/s, and 3 of 4 answers change. Real windows route mostly to the same experts (12.7 distinct at T3 against
+29.4 random), which the synthetic sweep does not model. IQ2_S and IQ3_S gate/up run at the same weights per second
+(~1.4 G/us at ntok 1), so these kernels are bound by dequantization, not bytes.
+
+**In-kernel grid barrier** (`gridbar*.txt`, upstream's gridbar_bench): threadgroups see stale flags after the barrier
+even with device fences (27k-687k stale reads), and it is slower than a dispatch boundary except at 40 groups with
+fences. Not usable on the M5 Ultra.
+
 ## Original plan (before step 1)
 
 Plan, in order of expected gain: (1) gr_down / gr_up grid and K-split for the Ultra (up to ~0.6-1.2 ms); (2) gr_norm2

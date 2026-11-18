@@ -1757,7 +1757,9 @@ class StrataEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+        except (OSError, AttributeError, ValueError):    # the pipe is gone (or a restart's close() took the process;
+            #                                              writing to the closed pipe is a ValueError, "I/O operation on
+            #                                              closed file.", which must not read as the engine's ERR line):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _send_for(self, born: int, text: str):
@@ -2782,7 +2784,7 @@ class StrataEngine:
             else:
                 self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
                 self.proc.stdin.flush()
-        except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
+        except (OSError, ValueError, EngineDied):        # the pipe is gone (closed: ValueError): the engine died, not the client
             if rid is not None:
                 self.rid_q.pop(rid, None)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -2882,7 +2884,7 @@ class StrataEngine:
                     try:
                         self.proc.stdin.write(stop_line)
                         self.proc.stdin.flush()
-                    except OSError:
+                    except (OSError, ValueError):             # a closed pipe: the engine is already gone
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt

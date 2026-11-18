@@ -1,12 +1,10 @@
-> **ain-soph fork (`serving` branch, on upstream v0.2.13).** Changes for a long-running Mac server (M5 Ultra, 96 GB):
-> - **Metal `--prefill auto` overlaps the prompt's host rows with the GPU.** Upstream, auto takes the CUDA fallback for
->   "no expert-cache slot to lend" (1024 tokens a call), but the Metal prompt path never borrows slots: every call was a
->   single Metal chunk, so the next chunk's embedding + PLE rows (the hostpipe) were computed on the CPU while the GPU
->   waited (~76% busy). Auto on Metal now hands each call 4 chunks of 1024 rows (`STRATA_METAL_PROMPT_CHUNK` still sets
->   the chunk), keeping the same buffers. Qwen3.8-Flash-Next AD-4.27, resident, `--batch 2`, MTP: prefill 1,854 -> 2,014
->   tok/s at 26K tokens (+9-18% across runs) and 1,999 -> 2,225 at 116K (+11%); peak memory, decode (117 / 74 tok/s at
->   1 / 2 streams) and the temp-0 output are unchanged. Before this, the same speed needed
->   `--prefill 4096` + `STRATA_METAL_PROMPT_CHUNK=1024`. Code: `prompt_chunk_for_auto` (metal/src/engine/window.cpp).
+> **ain-soph fork (`serving` branch, based on upstream v0.2.13).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Metal `--prefill auto` hands each call 4 chunks of 1024 rows | auto made 1024-token calls, so the CPU hostpipe never overlapped the GPU | `--prefill auto` (`STRATA_METAL_PROMPT_CHUNK` still sets the chunk) | prefill 26K 1,854 → 2,014 tok/s, 116K 1,999 → 2,225; decode, memory, temp-0 output unchanged |
+>
+> Full numbers: [Qwen3.8 Flash-Next in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#文本qwen38-flash-nextstrata). Upstream PRs: issue [#6182](https://github.com/Niko1221/Strata/issues/6182) + draft PR [#6183](https://github.com/Niko1221/Strata/pull/6183).
 
 <p align="center">
   <picture>

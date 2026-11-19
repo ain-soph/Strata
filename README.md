@@ -3,6 +3,9 @@
 > | Change | Why | Enable / default | Effect (M5 Ultra) |
 > |---|---|---|---|
 > | Metal `--prefill auto` hands each call 4 chunks of 1024 rows | auto made 1024-token calls, so the CPU hostpipe never overlapped the GPU | `--prefill auto` (`STRATA_METAL_PROMPT_CHUNK` still sets the chunk) | prefill 26K 1,854 → 2,014 tok/s, 116K 1,999 → 2,225; decode, memory, temp-0 output unchanged |
+> | M5 Ultra prefill kernels and cross-chunk host row prefetch | Keep the prompt matrix units fed and skip drafter work outside checkpoint bounds | On with the Metal prompt path | AD-4.27 variants, 26K prefill 2.28K → 2.75K tok/s. 260K needle matched |
+> | Metal fast load and parallel vision startup | Skip unused host allocations and overlap encoder startup | `STRATA_METAL_FAST_LOAD=0` or `STRATA_PARALLEL_VISION=0` disables the respective change | AtomicChat ready 8.44 → 4.46 s, peak wired 71,024 → 70,963 MiB |
+> | Metal decode fusion and optional IQ3_S gate/up and Wsg dot kernels | Reduce dispatches and test faster math while preserving release prompt parity | Fused router and GR on. `STRATA_METAL_IQ_DEC_OPT=3` and `STRATA_METAL_W_DOT=1` opt in to the precision-changing paths | Both AD-4.27 variants matched all four short responses with the two options off |
 >
 > Full numbers: [Qwen3.8 Flash-Next in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#文本qwen38-flash-nextstrata). Upstream PRs: issue [#6182](https://github.com/Niko1221/Strata/issues/6182) + draft PR [#6183](https://github.com/Niko1221/Strata/pull/6183).
 

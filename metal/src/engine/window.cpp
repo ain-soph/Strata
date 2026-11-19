@@ -178,7 +178,7 @@ bool metal_gr_opt() {
 int metal_iq_dec_opt() {
     static const int mode = [] {
         const char* e = std::getenv("STRATA_METAL_IQ_DEC_OPT");
-        return e ? std::atoi(e) : 3;
+        return e ? std::atoi(e) : 0;
     }();
     return mode;
 }

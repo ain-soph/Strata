@@ -115,9 +115,12 @@ void rope_scaling_set(const RopeScaling& scaling) { g_rope_scaling = scaling; }
 const RopeScaling& rope_scaling() { return g_rope_scaling; }
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
+    double inv_tab[256];
+    for (int i = 0; i < half && i < 256; ++i)
+        inv_tab[i] = std::pow(theta, -2.0 * (double) i / (double) n_rot);
     for (int p = 0; p < max_pos; ++p)
         for (int i = 0; i < half; ++i) {
-            const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
+            const double inv = i < 256 ? inv_tab[i] : std::pow(theta, -2.0 * (double) i / (double) n_rot);
             const double ang = (double) p * inv;
             cos_tab[(size_t) p * half + i] = (float) std::cos(ang);
             sin_tab[(size_t) p * half + i] = (float) std::sin(ang);

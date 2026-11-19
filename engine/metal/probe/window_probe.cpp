@@ -34,7 +34,8 @@ bool window_commit(void* w, int n_keep, std::string& err);
 bool window_copy_logits(void* w, int t, float* host);
 void window_reset(const strata::core::SessionState* ss);
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
-                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
+                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                const int64_t* hint_tokens = nullptr, int64_t hint_n = 0);
 }  // namespace strata::metal_engine
 
 int main(int argc, char** argv) {

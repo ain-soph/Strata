@@ -44,6 +44,49 @@ kernel void dq_f16(device const uchar* W [[buffer(0)]], device half* Wh [[buffer
 }
 
 struct GemmArgs { int M, N, K; int pad; };   // Y is M rows of N floats
+struct DotArgs { uint M, K; };               // Y[M] = Xh[M x K] . half(W[K])
+
+template <> [[host_name("dq_f16_8")]]
+kernel void dq_f16<T_Q8_0>(device const uchar* W [[buffer(0)]], device half* Wh [[buffer(1)]], constant DqArgs& a [[buffer(2)]],
+                           uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const int u = int(tg.x) * 64 + tid, r = int(tg.y);
+    if (u * 32 >= int(a.n_in)) return;
+    device const uchar* b = W + ulong(r) * a.row_bytes + ulong(u) * 34;
+    const float d = rdh(b);
+    device const packed_ushort4* p = (device const packed_ushort4*)(b + 2);
+    const int q = a.perm ? int(a.n_out / a.perm) : 1;
+    const int ro = a.perm ? (r % q) * int(a.perm) + r / q : r;
+    device half4* o4 = (device half4*)(Wh + ulong(ro) * a.n_in + ulong(u) * 32);
+    for (int j = 0; j < 4; ++j) {
+        const ushort4 v = ushort4(p[j]);
+        const half2 a0 = half2(float2(float(as_type<char>(uchar(v.x & 255))), float(as_type<char>(uchar(v.x >> 8)))) * d);
+        const half2 a1 = half2(float2(float(as_type<char>(uchar(v.y & 255))), float(as_type<char>(uchar(v.y >> 8)))) * d);
+        const half2 a2 = half2(float2(float(as_type<char>(uchar(v.z & 255))), float(as_type<char>(uchar(v.z >> 8)))) * d);
+        const half2 a3 = half2(float2(float(as_type<char>(uchar(v.w & 255))), float(as_type<char>(uchar(v.w >> 8)))) * d);
+        o4[2 * j]     = half4(a0, a1);
+        o4[2 * j + 1] = half4(a2, a3);
+    }
+}
+
+kernel void dot_f16_f32(device const half* A [[buffer(0)]], device const float* W [[buffer(1)]],
+                        device float* Y [[buffer(2)]], constant DotArgs& a [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]]) {
+    const int t = int(tg) * 8 + int(sg);
+    if (t >= int(a.M)) return;
+    device const half* ar = A + ulong(t) * a.K;
+    float acc = 0.0f;
+    for (int k = int(lane) * 4; k + 3 < int(a.K); k += 128) {
+        const half4 av = *(device const half4*)(ar + k);
+        const float4 wv = *(device const float4*)(W + k);
+        acc += dot(float4(av), float4(half4(wv)));
+    }
+    const int tail = int(a.K) & ~3;
+    if (tail + int(lane) < int(a.K))
+        acc += float(ar[tail + int(lane)]) * float(half(W[tail + int(lane)]));
+    acc = simd_sum(acc);
+    if (lane == 0) Y[t] = acc;
+}
 
 template <int TM, int TN, int SG>
 kernel void gemm_f16(device half* A [[buffer(0)]], device half* B [[buffer(1)]], device float* Y [[buffer(2)]],
@@ -61,7 +104,7 @@ kernel void gemm_f16(device half* A [[buffer(0)]], device half* B [[buffer(1)]],
 
 #define DQ(F) template [[host_name("dq_f16_" #F)]] kernel decltype(dq_f16<F>) dq_f16<F>;
 #define DQ_(F) DQ(F)
-DQ_(T_F32) DQ_(T_BF16) DQ_(T_Q8_0) DQ_(T_Q4_0) DQ_(T_Q5_0) DQ_(T_IQ4_NL) DQ_(T_IQ4_XS) DQ_(T_Q2_0) DQ_(T_IQ3_S) DQ_(T_Q3_K)
+DQ_(T_F32) DQ_(T_BF16) DQ_(T_Q4_0) DQ_(T_Q5_0) DQ_(T_IQ4_NL) DQ_(T_IQ4_XS) DQ_(T_Q2_0) DQ_(T_IQ3_S) DQ_(T_Q3_K)
 DQ_(T_Q4_K) DQ_(T_Q5_K) DQ_(T_Q6_K)
 template [[host_name("gemm_f16_64_64_4")]] kernel decltype(gemm_f16<64, 64, 4>) gemm_f16<64, 64, 4>;
 template [[host_name("gemm_f16_128_64_4")]] kernel decltype(gemm_f16<128, 64, 4>) gemm_f16<128, 64, 4>;
@@ -75,3 +118,4 @@ template [[host_name("gemm_f16_256_64_8")]] kernel decltype(gemm_f16<256, 64, 8>
 template [[host_name("gemm_f16_64_256_8")]] kernel decltype(gemm_f16<64, 256, 8>) gemm_f16<64, 256, 8>;
 template [[host_name("gemm_f16_128_32_4")]] kernel decltype(gemm_f16<128, 32, 4>) gemm_f16<128, 32, 4>;
 template [[host_name("gemm_f16_32_128_4")]] kernel decltype(gemm_f16<32, 128, 4>) gemm_f16<32, 128, 4>;
+template [[host_name("gemm_f16_16_64_2")]] kernel decltype(gemm_f16<16, 64, 2>) gemm_f16<16, 64, 2>;

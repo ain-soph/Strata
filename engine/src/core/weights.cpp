@@ -234,7 +234,16 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
         pool = at;
     }
-    if (arena_bytes < pool) {
+#if defined(STRATA_GPU_METAL)
+    const bool fast_load = [] {
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+        const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+        return !e || std::atoi(e) != 0;
+    }();
+#else
+    constexpr bool fast_load = false;
+#endif
+    if (!fast_load && arena_bytes < pool) {
         err = "arena is " + std::to_string(arena_bytes) + " B but the index needs " + std::to_string(pool);
         return false;
     }
@@ -254,8 +263,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
+    if (!fast_load && (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
+                       cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess)) {
         err = "cudaHostAlloc for the staging buffers failed";
         if (stage_in) cudaFreeHost(stage_in);
         if (stage_out) cudaFreeHost(stage_out);
@@ -302,10 +311,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
             err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
-            cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+            if (stage_in) cudaFreeHost(stage_in);
+            if (stage_out) cudaFreeHost(stage_out);
             return false;
         }
-        if (r.file != cur_file) {
+        if (!fast_load && r.file != cur_file) {
             if (cur) std::fclose(cur);
             const char* fn = file_name(r.file);
             const std::string p = pack_dir + "/" + (fn ? fn : "?");
@@ -379,9 +389,13 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             err = buf;
             bad = true;
         }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+        if (bad) {
+            if (stage_in) cudaFreeHost(stage_in);
+            if (stage_out) cudaFreeHost(stage_out);
+            return false;
+        }
 
-        for (int si = 0; si < n_segs; ++si) {
+        for (int si = 0; !fast_load && si < n_segs; ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
@@ -472,7 +486,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
 
         WeightRef wr;
-        wr.data = dst_base + r.dst_off;
+        wr.data = dst_base + (fast_load ? 0 : r.dst_off);
         wr.bytes = r.dst_bytes;
         wr.ne0 = r.ne0;
         wr.ne1 = r.ne1;
@@ -500,13 +514,13 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
     }
     if (cur) std::fclose(cur);
-    cudaFreeHost(stage_in);
-    cudaFreeHost(stage_out);
+    if (stage_in) cudaFreeHost(stage_in);
+    if (stage_out) cudaFreeHost(stage_out);
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if (!fast_load && cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
     return true;
 }
 

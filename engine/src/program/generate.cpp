@@ -5770,7 +5770,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* arena = nullptr;
-    if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
+#if defined(STRATA_GPU_METAL)
+    const bool metal_fast_load = [] {
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+        const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+        return !e || std::atoi(e) != 0;
+    }();
+    const uint64_t arena_alloc_bytes = metal_fast_load ? 4096 : pool_bytes;
+#else
+    constexpr bool metal_fast_load = false;
+    const uint64_t arena_alloc_bytes = pool_bytes;
+#endif
+    if (const cudaError_t ce = cudaMalloc(&arena, arena_alloc_bytes); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
         cudaGetLastError();
@@ -9266,7 +9277,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (!auto_cache || attempt - failed >= 6) break;
+            if (!auto_cache || attempt - failed >= 6 || metal_fast_load) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -9341,7 +9352,7 @@ int main(int argc, char** argv) {
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
         int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src && !src.unbuffered()) {
+        if (!metal_fast_load && !per_layer && srcp == &src && !src.unbuffered()) {
             const char* v = std::getenv("STRATA_FILL_AHEAD");
             fill_ahead = v == nullptr ? 256 : std::max(0, std::atoi(v));
             if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
@@ -9359,7 +9370,7 @@ int main(int argc, char** argv) {
             }
         }
         for (int64_t i = 0; i < want; ++i) {
-            if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
+            if (!metal_fast_load && !per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
                 else read_batch(i);
                 if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
@@ -9369,6 +9380,11 @@ int main(int argc, char** argv) {
             if (slot == strata::core::kNotResident) {
                 if (per_layer) continue;
                 break;
+            }
+            if (metal_fast_load) {
+                fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+                ++prefilled;
+                continue;
             }
             const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
             const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
@@ -9391,7 +9407,7 @@ int main(int argc, char** argv) {
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         // (STRATA_EXPERT_NIBBLE: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
-        if (prefilled > 0 && !nib::layer(profile[0].first).on &&
+        if (!metal_fast_load && prefilled > 0 && !nib::layer(profile[0].first).on &&
             !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob_stable(profile[0].first, profile[0].second), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
@@ -9872,7 +9888,7 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    if (!metal_fast_load && srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
         (la_env == nullptr || std::atoi(la_env) != 0)) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -13948,7 +13964,7 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
-        int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        int64_t pp_total = 0, pp_from = 0, pp_next_check = 0, pp_cut_ckpt = 0;
         int64_t pp_check_anchor = 0;   // #6052: where the request resumed: the periodic checkpoints sit on its grid
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -14208,6 +14224,22 @@ int main(int argc, char** argv) {
                                                  "runs: %s\n", why);
                     }
                 }
+            }
+            if (use_mtp) {
+                int64_t next_ckpt = 0;
+                if (o.prompt_cache > 0) {
+                    if (pp_cut_ckpt > p0) next_ckpt = pp_cut_ckpt;
+                    if (o.prompt_cache_every > 0 && pp_next_check > p0 && pp_next_check < pp_total &&
+                        (next_ckpt == 0 || pp_next_check < next_ckpt)) {
+                        next_ckpt = pp_next_check;
+                    }
+                    if (o.prompt_cache_tail && o.prompt_cache_every > 0 && !pp_tail_saved &&
+                        pp_total - (p0 + T) <= std::max<int64_t>(8192, T)) {
+                        const int64_t tc = p0 + T;
+                        if (next_ckpt == 0 || tc < next_ckpt) next_ckpt = tc;
+                    }
+                }
+                mtp.set_next_checkpoint(next_ckpt);
             }
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
 #if defined(STRATA_HAVE_DFLASH2)
@@ -19303,6 +19335,7 @@ int main(int argc, char** argv) {
             read_t0 = Clock::now();
             pp_check_anchor = resume;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
+            pp_cut_ckpt = 0;
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             {
                 std::lock_guard<std::mutex> lk(part_mu);
@@ -20428,8 +20461,9 @@ int main(int argc, char** argv) {
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
+                    sp.set_next_prompt_hint(r < b0 ? ids.data() + r : nullptr, r < b0 ? (b0 - r) : 0);
                     const auto tq = Clock::now();
-                    if (!run_conc(q, r)) return false;
+                    if (!run_conc(q, r)) { sp.set_next_prompt_hint(nullptr, 0); return false; }
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
@@ -20633,6 +20667,7 @@ int main(int argc, char** argv) {
             };
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
+                pp_cut_ckpt = (to == turn_at || to == root_at || to == message_at || to == pin_at) ? to : 0;
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {

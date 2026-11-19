@@ -785,7 +785,21 @@ int64_t qsa_kv_resident_min() {
 }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+#if defined(STRATA_GPU_METAL)
+static bool metal_fast_load_layer() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+        const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+        return !e || std::atoi(e) != 0;
+    }();
+    return on;
+}
+#endif
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_layer()) return 4096;
+#endif
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
@@ -810,6 +824,55 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_layer()) {
+        st.kv_int8 = g_kv_int8 && !g_kv_q4;
+        st.kv_q4 = g_kv_q4;
+        if (g_kv_hybrid && ring_cells <= 0) {
+            st.kv_hybrid = true;
+            st.kv_int8 = false;
+            st.kv_q4 = false;
+        }
+        st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);
+        st.kv_mode = p.mode;
+        st.n_slots = p.slots;
+        st.kv_elastic = -1;
+        st.k_q = c.take<int8_t>(16);
+        st.v_q = c.take<int8_t>(16);
+        st.k_scale = c.take<uint16_t>(8);
+        st.v_scale = c.take<uint16_t>(8);
+        st.v_q4 = c.take<uint8_t>(16);
+        st.k_q4 = c.take<uint8_t>(16);
+        st.k_pool = c.take<uint16_t>(8);
+        st.v_pool = c.take<uint16_t>(8);
+        st.page_table = c.take<int32_t>(4);
+        st.n_pages = pages;
+        st.max_cells = max_cells;
+        st.map = strata::kernels::KvStreamMap{};
+        st.map.page_table = st.page_table;
+        st.map.n_blocks = pages;
+        st.map.n_slots = p.slots;
+        st.idx_tail = c.take<float>(4);
+        st.idx_dead = c.take<float>(4);
+        st.idx_pooled_rows = p.pooled_rows;
+        st.idx_pooled = c.take<float>(4);
+        st.idx_block_pos = c.take<int32_t>(1);
+        st.cos_tab = share_rope ? share_rope->cos_tab : c.take<float>(4);
+        st.sin_tab = share_rope ? share_rope->sin_tab : c.take<float>(4);
+        st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
+        st.attention_status = c.take<int32_t>(1);
+        st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
+        if (strata::core::host_alloc_guarded((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                          cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            strata::core::host_alloc_guarded((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
+                cudaSuccess) {
+            return 0;
+        }
+        st.host_step[strata::kernels::kStepCount] = 0;
+        st.host = strata::kernels::KvHostPools{};
+        return c.used;
+    }
+#endif
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
@@ -1026,7 +1089,11 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
                                        qsa_shapes(g), stream);
 }
 
-uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
+uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_layer()) return 4096;
+#endif
+    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;
 // attn
@@ -1039,7 +1106,32 @@ n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
 n += strata::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
 // attn_scratch
 return align_up16(n) + 256;}
-uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
+uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_layer()) {
+        Cursor c{(uint8_t*) base};
+        b.x_q8k = c.take_bytes(16);
+        b.x_q8_0 = c.take_bytes(16);
+        b.x_bf16 = c.take<uint16_t>(8);
+        b.q_full = c.take<float>(4);
+        b.qcur = c.take<float>(4);
+        b.kcur = c.take<float>(4);
+        b.vcur = c.take<float>(4);
+        b.idx_raw = c.take<float>(4);
+        b.q_idx = c.take<float>(4);
+        b.cell_scores = c.take<float>(4);
+        b.ids = c.take<int32_t>(4);
+        b.k_scratch = c.take<uint16_t>(8);
+        b.v_scratch = c.take<uint16_t>(8);
+        b.attn = c.take<float>(4);
+        b.attn16 = c.take<uint16_t>(8);
+        b.attn32 = c.take<float>(4);
+        b.attn_q8k = c.take_bytes(16);
+        b.attn_scratch = c.take<float>(4);
+        return c.used;
+    }
+#endif
+    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
 // **THE ENGINE SPENDS 1.047 ms PER LAYER WITH THE EXPERTS OFF, AND EVERY COST MODEL IN `bench/` PREDICTS LESS

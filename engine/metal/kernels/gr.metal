@@ -11,6 +11,9 @@
 // lo[t] (hc_lr), inject[t] (hc), XP planes of n_tok rows.
 
 constant int GR_NTOK [[function_constant(1)]];
+// The prompt library also includes moe_mm.metal, which uses slot 24.
+constant bool GR_RAW_ONLY [[function_constant(27)]];
+constant bool gr_raw_only = is_function_constant_defined(GR_RAW_ONLY) ? GR_RAW_ONLY : false;
 // GEO_NJ: n_embd / 256, the elements per thread of one stream's row in gr_norm2 (Flash-Next 10); GEO_GRU_NU: the units of one up row a lane of
 // the prefetching gr_up holds, ceil(hc_lr / 32 / 4) (Flash-Next 3).  The host prelude (engine/geo.h) defines them for another shape.
 #ifdef GEO_NJ
@@ -264,18 +267,22 @@ kernel void gr_up_f(device const uchar* w_up [[buffer(0)]], device const float* 
                               0.00006103515625f};
         const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
         raw[0] = m;
-        raw[plane] = m * q2s[j & 7];
-        raw[2 * plane] = m * p4s[j & 3];
-        raw[3 * plane] = (j & 1) ? m * 0.00390625f : m;
         if (xh16) put_x16(xp, plane, t * n + dd, j, m);
-        msum[t][j] = m;
+        if (!gr_raw_only) {
+            raw[plane] = m * q2s[j & 7];
+            raw[2 * plane] = m * p4s[j & 3];
+            raw[3 * plane] = (j & 1) ? m * 0.00390625f : m;
+            msum[t][j] = m;
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t < GR_NTOK && j == 0) {
-        // the per-16 sum in xprep's order (even and odd partial sums, then added)
-        float s0 = 0.0f, s1 = 0.0f;
-        for (int k = 0; k < 16; k += 2) { s0 += msum[t][k]; s1 += msum[t][k + 1]; }
-        xp[4 * a.n_tok * uint(n) + t * (n / 16) + tg.x] = s0 + s1;
+    if (!gr_raw_only) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t < GR_NTOK && j == 0) {
+            // the per-16 sum in xprep's order (even and odd partial sums, then added)
+            float s0 = 0.0f, s1 = 0.0f;
+            for (int k = 0; k < 16; k += 2) { s0 += msum[t][k]; s1 += msum[t][k + 1]; }
+            xp[4 * a.n_tok * uint(n) + t * (n / 16) + tg.x] = s0 + s1;
+        }
     }
 }
 

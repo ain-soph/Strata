@@ -115,9 +115,11 @@ kernel void gemv_pair(device const uchar* Wg [[buffer(0)]], device const float* 
     threadgroup uint tab1[fmt<F1>::TAB];
     threadgroup uint tab2[fmt<F2>::TAB];
     (void)TB;
-    load_tab<F1>(tab1, tid, SG * 32);
-    load_tab<F2>(tab2, tid, SG * 32);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (fmt<F1>::TAB > 1 || fmt<F2>::TAB > 1) {
+        load_tab<F1>(tab1, tid, SG * 32);
+        load_tab<F2>(tab2, tid, SG * 32);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     const int li = lane % LPR;
     const int row = (int(tg.x) * SG + sg) * RG + lane / LPR;
     const int rr = min(row, int(a.n_out) - 1);
@@ -126,24 +128,60 @@ kernel void gemv_pair(device const uchar* Wg [[buffer(0)]], device const float* 
     const int s16n = int(a.n_in) / 16;
     float ag[8], au[8];
     for (int t = 0; t < 8; ++t) ag[t] = au[t] = 0.0f;
-    for (int u = li; u < int(a.n_in) / U1; u += LPR) {
-        float q[U1];
-        float4 sc;
-        Dec<F1>::run(rg, u, q, sc, tab1);
-        for (int t = 0; t < NTOK; ++t) {
-            float xs[U1], xsum[2];
-            X<F1>::load(xg + t * int(a.x_stride), s16 + t * s16n, u, xs, xsum);
-            ag[t] += unit_combine<U1>(q, sc, xs, xsum);
+    if (F1 == T_Q8_0 && F2 == T_Q8_0) {
+        // Both Q8_0: read raw x once per 32-weight block and accumulate s0..s3 in exact unit_combine<32> order.
+        for (int u = li; u < int(a.n_in) / 32; u += LPR) {
+            device const uchar* bg = rg + u * 34;
+            device const uchar* bu = ru + u * 34;
+            const float dg = rdh(bg), du = rdh(bu);
+            device const ushort* pg = (device const ushort*)(bg + 2);
+            device const ushort* pu = (device const ushort*)(bu + 2);
+            uint wg[8], wu[8];
+            for (int k = 0; k < 8; ++k) {
+                wg[k] = uint(pg[2 * k]) | (uint(pg[2 * k + 1]) << 16);
+                wu[k] = uint(pu[2 * k]) | (uint(pu[2 * k + 1]) << 16);
+            }
+            for (int t = 0; t < NTOK; ++t) {
+                device const float4* xp = (device const float4*)(xg + t * int(a.x_stride) + u * 32);
+                float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+                float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const float4 xl = xp[k], xh = xp[k + 4];
+                    const float4 gl = float4(as_type<char4>(wg[k])), gh = float4(as_type<char4>(wg[k + 4]));
+                    const float4 ul = float4(as_type<char4>(wu[k])), uh = float4(as_type<char4>(wu[k + 4]));
+                    g0 = fma(gl.z, xl.z, fma(gl.x, xl.x, g0));
+                    g1 = fma(gl.w, xl.w, fma(gl.y, xl.y, g1));
+                    g2 = fma(gh.z, xh.z, fma(gh.x, xh.x, g2));
+                    g3 = fma(gh.w, xh.w, fma(gh.y, xh.y, g3));
+                    u0 = fma(ul.z, xl.z, fma(ul.x, xl.x, u0));
+                    u1 = fma(ul.w, xl.w, fma(ul.y, xl.y, u1));
+                    u2 = fma(uh.z, xh.z, fma(uh.x, xh.x, u2));
+                    u3 = fma(uh.w, xh.w, fma(uh.y, xh.y, u3));
+                }
+                ag[t] += dg * (g0 + g1) + dg * (g2 + g3);
+                au[t] += du * (u0 + u1) + du * (u2 + u3);
+            }
         }
-    }
-    for (int u = li; u < int(a.n_in) / U2; u += LPR) {
-        float q[U2];
-        float4 sc;
-        Dec<F2>::run(ru, u, q, sc, tab2);
-        for (int t = 0; t < NTOK; ++t) {
-            float xs[U2], xsum[2];
-            X<F2>::load(xu + t * int(a.x_stride), s16 + t * s16n, u, xs, xsum);
-            au[t] += unit_combine<U2>(q, sc, xs, xsum);
+    } else {
+        for (int u = li; u < int(a.n_in) / U1; u += LPR) {
+            float q[U1];
+            float4 sc;
+            Dec<F1>::run(rg, u, q, sc, tab1);
+            for (int t = 0; t < NTOK; ++t) {
+                float xs[U1], xsum[2];
+                X<F1>::load(xg + t * int(a.x_stride), s16 + t * s16n, u, xs, xsum);
+                ag[t] += unit_combine<U1>(q, sc, xs, xsum);
+            }
+        }
+        for (int u = li; u < int(a.n_in) / U2; u += LPR) {
+            float q[U2];
+            float4 sc;
+            Dec<F2>::run(ru, u, q, sc, tab2);
+            for (int t = 0; t < NTOK; ++t) {
+                float xs[U2], xsum[2];
+                X<F2>::load(xu + t * int(a.x_stride), s16 + t * s16n, u, xs, xsum);
+                au[t] += unit_combine<U2>(q, sc, xs, xsum);
+            }
         }
     }
     for (int t = 0; t < NTOK; ++t) {
@@ -156,6 +194,7 @@ kernel void gemv_pair(device const uchar* Wg [[buffer(0)]], device const float* 
 #define GP(F1, F2) GP_(F1, F2)
 #define GP_ROW(F1) GP(F1, T_IQ3_S) GP(F1, T_IQ4_XS) GP(F1, T_Q2_0) GP(F1, T_Q3_K) GP(F1, T_Q4_K) GP(F1, T_Q5_K) GP(F1, T_Q6_K)
 GP_ROW(T_IQ3_S) GP_ROW(T_IQ4_XS) GP_ROW(T_Q2_0) GP_ROW(T_Q3_K) GP_ROW(T_Q4_K) GP_ROW(T_Q5_K) GP_ROW(T_Q6_K)
+GP(T_Q8_0, T_Q8_0)
 // Q2_0 with raw activations (the shared expert's down reading the pair's raw h)
 GV_SET(T_Q2_0R)
 

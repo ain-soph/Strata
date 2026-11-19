@@ -339,6 +339,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+#if defined(STRATA_GPU_METAL)
+    const bool fast_load = [] {
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+        const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+        return !e || std::atoi(e) != 0;
+    }();
+#else
+    constexpr bool fast_load = false;
+#endif
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
@@ -406,7 +415,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
                 // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
+                if (!fast_load && eligible(tensor, include_ple_key) && !outside(tensor.name) &&
                     strata::kernels::native_mmvq_supported(tensor.type))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
@@ -424,6 +433,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
                     const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
+                    if (fast_load) {
+                        const uint64_t q8_bytes = (n / 32) * 34;
+                        max_in = (std::max)(max_in, (int) ref.ne0);
+                        total += q8_bytes;
+                        allocated += alloc_bytes(q8_bytes);
+                        pending.push_back(Pending{&ref, 8, q8_bytes, DevicePtr(nullptr), DevicePtr()});
+                        continue;
+                    }
                     const std::vector<uint8_t> q8 = q8_0_of_bf16((const uint16_t*) gguf.tensor_data(tensor), n);
                     void* allocation = nullptr;
                     auto status = cudaMalloc(&allocation, q8.size());
@@ -450,6 +467,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                if (fast_load) {
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += bytes;
+                    allocated += alloc_bytes(bytes);
+                    pending.push_back(Pending{&ref, (int) tensor.type, bytes, DevicePtr(nullptr), DevicePtr()});
+                    continue;
+                }
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
@@ -594,14 +618,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+        const auto status = cudaMalloc(&allocation, fast_load ? 256 : strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }        // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         uint64_t packed_bytes = 0;
         size_t packed_count = 0;
         for (auto& item : pending) {
-            item.ref->native_data = item.data.get();
+            item.ref->native_data = item.data ? item.data.get() : scratch.get();
             item.ref->native_type = item.type;
             item.ref->native_bytes = item.bytes;
             item.ref->native_q8_1 = scratch.get();
@@ -613,7 +637,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 ++packed_count;
                 weights_.push_back(item.packed.release());
             }
-            weights_.push_back(item.data.release());
+            if (item.data) weights_.push_back(item.data.release());
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",

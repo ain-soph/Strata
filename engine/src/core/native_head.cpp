@@ -122,6 +122,32 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = "native head: truncated output.weight payload";
             return false;
         }
+#if defined(STRATA_GPU_METAL)
+        const bool fast_load = [] {
+            if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+            const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+            return !e || std::atoi(e) != 0;
+        }();
+        if (fast_load) {
+            void* weights = nullptr;
+            void* scratch = nullptr;
+            if (cudaMalloc(&weights, 256) != cudaSuccess || cudaMalloc(&scratch, 256) != cudaSuccess) {
+                if (scratch) cudaFree(scratch);
+                if (weights) cudaFree(weights);
+                err = "native head: placeholder alloc failed";
+                return false;
+            }
+            weights_ = weights;
+            host_ = nullptr;
+            { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
+            scratch_ = scratch;
+            bytes_ = bytes;
+            n_in_ = (int) n_in;
+            n_out_ = (int) n_out;
+            type_ = (int) tensor->type;
+            return true;
+        }
+#endif
         void* weights = nullptr;
         void* scratch = nullptr;
         void* host = nullptr;
@@ -538,6 +564,28 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             bytes_ = 0;
             return false;
         }
+#if defined(STRATA_GPU_METAL)
+        const bool fast_load = [] {
+            if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+            const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+            return !e || std::atoi(e) != 0;
+        }();
+        if (fast_load) {
+            void* d = nullptr;
+            if (cudaHostAlloc(&host_, 256, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
+                if (host_) cudaFreeHost(host_);
+                host_ = nullptr;
+                err = "native embedding: placeholder alloc failed";
+                return false;
+            }
+            dev_ = d;
+            type_ = (int) t->type;
+            n_embd_ = n_embd;
+            n_vocab_ = n_vocab;
+            return true;
+        }
+#endif
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
         // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a

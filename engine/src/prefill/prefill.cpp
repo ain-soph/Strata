@@ -284,7 +284,8 @@ namespace strata::metal_engine {
 bool window_ensure(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int64_t max_cells, std::string& err);
 bool prompt_taps(const std::vector<int>& layers, int64_t first_pos, const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb, std::string& err);   // dflash2.inc
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
-                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
+                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                const int64_t* hint_tokens = nullptr, int64_t hint_n = 0);
 }  // namespace strata::metal_engine
 #endif
 
@@ -9638,7 +9639,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // DFlash2: the window writes the taps of the prompt rows at positions >= tap_first_ and hands them to on_taps after each chunk
         const bool taps = !tap_layers_.empty() && on_taps;
         if (taps && !strata::metal_engine::prompt_taps(tap_layers_, tap_first_, on_taps, err)) return false;
-        const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, on_chunk, err);
+        const int64_t* hint_tokens = next_hint_tokens_;
+        const int64_t hint_n = next_hint_n_;
+        next_hint_tokens_ = nullptr;
+        next_hint_n_ = 0;
+        const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, on_chunk, err, hint_tokens, hint_n);
         if (taps) {
             std::string off_err;
             strata::metal_engine::prompt_taps(tap_layers_, 0, {}, off_err);   // no callback after the prompt

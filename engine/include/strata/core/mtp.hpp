@@ -57,6 +57,8 @@ public:
     int expert_d_type() const { return expert_layout_.d_type; }
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// Next mid-prompt checkpoint boundary (0 = none), so prefill() keeps trailing window cells before checkpoints.
+    void set_next_checkpoint(int64_t pos) { next_ckpt_ = pos; }
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
     /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
     /// table.  nullptr switches it off.
@@ -243,6 +245,14 @@ public:
         const int64_t w = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
         return std::max<int64_t>(w, cell_floor_);
     }
+    int64_t first_needed_for(int64_t cell0, int64_t n) const {
+        int64_t fn = first_needed();
+        if (window_ > 0 && next_ckpt_ > 0 && cell0 < next_ckpt_) {
+            const int64_t ck = std::max<int64_t>(cell_floor_, next_ckpt_ - window_ - 64);
+            if (cell0 + n > ck) fn = std::min(fn, ck);
+        }
+        return fn;
+    }
     /// The cells the draft layer attends to (0 = every cell), as load() settled it.
     int64_t window() const { return window_; }
     /// KVA: call before load().  The draft layer's attention then reads its cell range through a floor, which stays 0
@@ -388,6 +398,7 @@ private:
     bool floor_on_ = false;     // enable_cell_floor: the attention goes through window_ids_floor
     int32_t *h_floor_ = nullptr, *m_floor_ = nullptr;   // the floor, mapped: the kernel reads it when it runs
     int64_t prompt_len_ = 0;
+    int64_t next_ckpt_ = 0;
     const int32_t* rr_res_ = nullptr;
     float rr_margin_ = 0.0f;
     int rr_lo_ = 6, rr_hi_ = 9;

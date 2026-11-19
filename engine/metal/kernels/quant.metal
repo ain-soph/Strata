@@ -466,6 +466,19 @@ static inline void put_signed4(thread float* q, uint g, uint s) {
     q[2] = (s & 4) ? -float(v[2]) : float(v[2]);
     q[3] = (s & 8) ? -float(v[3]) : float(v[3]);
 }
+// Branchless IEEE-754 sign-bit OR for strictly non-zero grid magnitudes (IQ2_S in {8,25,43}, IQ3_S in {1..15}).
+static inline float4 signed4_f32(uint g, uint s) {
+    const uchar4 v = as_type<uchar4>(g);
+    const uint4 bits = as_type<uint4>(float4(v));
+    const uint4 sgn = uint4((s & 1u) << 31, (s & 2u) << 30, (s & 4u) << 29, (s & 8u) << 28);
+    return as_type<float4>(bits | sgn);
+}
+static inline half4 signed4_f16(uint g, uint s) {
+    const uchar4 v = as_type<uchar4>(g);
+    const ushort4 bits = as_type<ushort4>(half4(v));
+    const ushort4 sgn = ushort4(ushort((s & 1u) << 15), ushort((s & 2u) << 14), ushort((s & 4u) << 13), ushort((s & 8u) << 12));
+    return as_type<half4>(bits | sgn);
+}
 
 // IQ3_XXS: 256 = 8 x 32; unit = half of a 32 (two grid pairs).
 template <> inline float deq<T_IQ3_XXS>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {

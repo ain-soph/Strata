@@ -8,6 +8,7 @@
 #include "ref_quant.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -98,7 +99,10 @@ int main() {
             std::memset(pl1.ptr, 0, pl1.bytes);
             cx.run({g, rt});
             bool ok = true;
-            for (int rep_ = 0; rep_ < 2; ++rep_) {
+            const int reps = std::getenv("FUSE_REPS") ? std::max(2, std::atoi(std::getenv("FUSE_REPS"))) : 1000;
+            std::memset(cnt.ptr, 0, cnt.bytes);
+            int fail_rep = -1;
+            for (int rep_ = 0; rep_ < reps; ++rep_) {
                 std::memset(pl2.ptr, 0, pl2.bytes);
                 mtl::Dispatch f;
                 f.p = &pf;
@@ -107,13 +111,16 @@ int main() {
                 f.grid[0] = NE / 16;
                 f.tg[0] = 512;
                 cx.run({f});
-                ok = ok && std::memcmp(lg1.ptr, lg2.ptr, 4 * nt * 512) == 0 && std::memcmp(id1.ptr, id2.ptr, 4 * nt * 10) == 0 &&
-                     std::memcmp(w1.ptr, w2.ptr, 4 * nt * 10) == 0 && std::memcmp(pl1.ptr, pl2.ptr, 4 * P_INTS) == 0 &&
-                     cnt.as<uint32_t>()[0] == 0;
+                const bool r_ok = std::memcmp(lg1.ptr, lg2.ptr, 4 * nt * 512) == 0 && std::memcmp(id1.ptr, id2.ptr, 4 * nt * 10) == 0 &&
+                                  std::memcmp(w1.ptr, w2.ptr, 4 * nt * 10) == 0 && std::memcmp(pl1.ptr, pl2.ptr, 4 * P_INTS) == 0 &&
+                                  cnt.as<uint32_t>()[0] == 0;
+                if (!r_ok && fail_rep < 0) fail_rep = rep_;
+                ok = ok && r_ok;
             }
             fails += !ok;
-            std::printf("router_route %s ntok %d: logits, ids, w, plan bitwise (2 runs) %s\n", ref::type_name(rty), nt,
-                        ok ? "PASS" : "FAIL");
+            std::printf("router_route %s NE %d ntok %d: logits, ids, w, plan bitwise (%d runs) %s%s\n", ref::type_name(rty), NE, nt,
+                        reps, ok ? "PASS" : "FAIL",
+                        fail_rep >= 0 ? (" (first fail at rep " + std::to_string(fail_rep) + ")").c_str() : "");
         }
         }
     }

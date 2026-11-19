@@ -145,6 +145,9 @@ const mtl::Buffer* g_xpx = nullptr;
 const mtl::Buffer* g_xph = nullptr;
 // EXPERT_F16=1: moe_gu16 / moe_down16 (STRATA_METAL_F16) - x from the half plane x * 4^-(i % 4), h handed down as half
 const bool g_f16 = std::getenv("EXPERT_F16") != nullptr;
+const bool g_iq_opt = std::getenv("EXPERT_IQ_OPT") && std::string(std::getenv("EXPERT_IQ_OPT")) == "1";
+const bool g_iq_f16 = std::getenv("EXPERT_IQ_F16") && std::string(std::getenv("EXPERT_IQ_F16")) == "1";
+const bool g_iq_tg = std::getenv("EXPERT_IQ_TG") && std::string(std::getenv("EXPERT_IQ_TG")) == "1";
 const mtl::Buffer* g_h16 = nullptr;
 
 void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::Buffer& W, size_t w_off,
@@ -435,8 +438,19 @@ int main(int argc, char** argv) {
         K.plan = cx.pipeline(lib, "moe_plan");
         K.prep = cx.pipeline(lib, "xprep");
         K.comb = cx.pipeline(lib, "moe_combine");
-        K.gu = cx.pipeline(lib, kname(g_f16 ? "moe_gu16" : "moe_gu", gu, a), mtl::Constants().i(22, std::getenv("MOE_PROBE") ? std::atoi(std::getenv("MOE_PROBE")) : 0).b(23, std::getenv("QUANT_CTAB") != nullptr));
-        K.dn = cx.pipeline(lib, kname(g_f16 ? "moe_down16" : "moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, b));
+        const bool opt_gu = g_iq_opt && !g_f16 && (gu == ref::IQ2_S || gu == ref::IQ3_S);
+        const bool opt_dn = false;
+        const std::string guk = opt_gu ? (g_iq_tg ? kname("moe_gu_opt_tg", gu, a) : kname("moe_gu_opt", gu, a))
+                                       : kname(g_f16 ? "moe_gu16" : "moe_gu", gu, a);
+        const std::string dnk = opt_dn ? kname("moe_down_opt", dn, b)
+                                       : kname(g_f16 ? "moe_down16" : "moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, b);
+        mtl::Constants gc = mtl::Constants().i(22, std::getenv("MOE_PROBE") ? std::atoi(std::getenv("MOE_PROBE")) : 0)
+                                            .b(23, std::getenv("QUANT_CTAB") != nullptr);
+        mtl::Constants dc;
+        if (opt_gu && g_iq_f16) gc.b(26, true);
+        if (opt_dn && g_iq_f16) dc.b(26, true);
+        K.gu = cx.pipeline(lib, guk, gc);
+        K.dn = cx.pipeline(lib, dnk, dc);
         K.cgu = a;
         K.cdn = b;
         if (std::getenv("PIPE_INFO"))
@@ -581,7 +595,8 @@ int main(int argc, char** argv) {
         }
         for (int i = 0; i < ntok * N_EMBD; ++i) ey.add(y.as<float>()[i], yref[i]);
         // fp16: half products and h rounded to half on the way down - rel L2 ~1e-3 against double
-        const double tl2 = g_f16 ? 4e-3 : 1e-5, tmax = g_f16 ? 1e-2 : 1e-4;
+        const bool any_f16 = g_f16 || (g_iq_opt && g_iq_f16);
+        const double tl2 = any_f16 ? 4e-3 : 1e-5, tmax = any_f16 ? 1e-2 : 1e-4;
         const bool ok = plan_ok && eh.rel_l2() < tl2 && ey.rel_l2() < tl2 && eh.rel_max() < tmax && ey.rel_max() < tmax;
         std::printf("parity %s/%s ntok %d gu %d,%d,%d dn %d,%d,%d: plan %s (%d groups), h rel L2 %.2e max %.2e, "
                     "y rel L2 %.2e max %.2e  %s\n",

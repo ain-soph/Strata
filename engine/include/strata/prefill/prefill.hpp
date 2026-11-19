@@ -227,6 +227,10 @@ public:
     bool run_expert_window(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
                            int64_t next_checkpoint, int64_t checkpoint_interval, int64_t prompt_end,
                            int64_t short_read, bool save_tail);
+    void set_next_prompt_hint(const int64_t* tokens, int64_t n) {
+        next_hint_tokens_ = tokens;
+        next_hint_n_ = n;
+    }
 
     const PrefillStats& stats() const { return stats_; }
 
@@ -389,6 +393,8 @@ private:
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
+    const int64_t* next_hint_tokens_ = nullptr;
+    int64_t next_hint_n_ = 0;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],

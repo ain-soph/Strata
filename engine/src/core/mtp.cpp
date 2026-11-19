@@ -84,7 +84,7 @@ void mtp_quant_q4_0(const float* x, void* dst, int64_t n) { ggml_quantize_chunk(
 namespace strata::metal_engine {
 bool mtp_load(const std::string& rt_dir, int max_t, std::string& err);
 void mtp_bind_state(strata::core::QsaState& st);
-bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, int64_t first_needed, std::string& err);
 bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs, float min_p,
                int* n_drafts, std::string& err);
 }  // namespace strata::metal_engine
@@ -345,10 +345,16 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)
-    (void) window; (void) shared;
+    (void) shared;
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
+    // Metal draft attention reads at most 2051 trailing cells [max(0, cell0 - 2050), cell0] (G_BUD).
+    static const bool skip_on = [] {
+        const char* e = std::getenv("STRATA_METAL_MTP_SKIP");
+        return !(e && std::string(e) == "0");
+    }();
+    window_ = skip_on ? (window > 0 ? std::min<int64_t>(window, 2051) : 2051) : 0;
     if (!strata::metal_engine::mtp_load(rt_dir, max_t, err)) return false;
     strata::metal_engine::mtp_bind_state(st_);   // the parked conversation's draft K/V is the window's own buffers
     return true;
@@ -1728,7 +1734,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                          bool sync) {
 #if defined(STRATA_GPU_METAL)
     (void) R_rows; (void) sync;   // the rows are the decode window's own (the Metal drafter reads them in place)
-    return strata::metal_engine::mtp_prefill(next_tokens, n, cell0, err);
+    return strata::metal_engine::mtp_prefill(next_tokens, n, cell0, this->first_needed_for(cell0, n), err);
 #endif
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();

@@ -448,7 +448,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         hc_read(bl + "hc_ffn", true);
         const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
         const gguf::Tensor& twsg = T(bl + "ffn_gate_inp_shexp.weight");
-        static const bool wdot_on = [] { const char* e = std::getenv("STRATA_METAL_W_DOT"); return !(e && std::string(e) == "0"); }();
+        static const bool wdot_on = [] { const char* e = std::getenv("STRATA_METAL_W_DOT"); return e && std::string(e) == "1"; }();
         const bool use_wdot = wdot_on && twsg.type == ref::F32;
         dq(T(bl + "ffn_gate_inp.weight"), b.Wr);
         if (!use_wdot) dq(twsg, b.Wsg);

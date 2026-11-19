@@ -286,6 +286,9 @@ static inline device const uchar* arena_slot(uint v, device const uchar* W, devi
 // a probe for the bench (function constant 5): 1 = the weights not decoded (a cheap fill), 2 = no matrix multiply
 constant int MM_PROBE [[function_constant(5)]];
 constant int mm_probe = is_function_constant_defined(MM_PROBE) ? MM_PROBE : 0;
+// MM_HOIST (function constant 24, default true): hoist 256-weight superblock headers across the 8 TK=32 iterations of IQ2_S/IQ3_S.
+constant bool MM_HOIST_FC [[function_constant(24)]];
+constant bool mm_hoist = !is_function_constant_defined(MM_HOIST_FC) || MM_HOIST_FC;
 
 template <int F, int TM, int TN, int TK, int SG>
 kernel void mm_gu2(device const uchar* W [[buffer(0)]], device const half* XS [[buffer(1)]],
@@ -486,7 +489,7 @@ template <> struct W4<T_IQ2_S> {
         const uint s = b[2 + 32 + 4 * ib + l];
         const uint scb = b[74 + ib];
         const float sc = rdh(b) * (0.5f + float((scb >> (4 * (l >> 1))) & 15)) * 0.25f;
-        return w4_signed(tab[2 * idx + hh], hh ? s >> 4 : s, sc);
+        return w4_signed(g_iq2s(tab, idx, hh), hh ? s >> 4 : s, sc);
     }
 };
 template <> struct W4<T_IQ3_S> {
@@ -499,7 +502,7 @@ template <> struct W4<T_IQ3_S> {
         const uint s = b[74 + 4 * ib + l];
         const uint scb = b[106 + (ib >> 1)];
         const float sc = rdh(b) * float(1 + 2 * ((scb >> (4 * (ib & 1))) & 15));
-        return w4_signed(tab[i], hh ? s >> 4 : s, sc);
+        return w4_signed(g_iq3s(tab, i), hh ? s >> 4 : s, sc);
     }
 };
 template <> struct W4<T_IQ4_XS> {   // 256 a block: d, scales_h, scales_l[4], qs[128]; 32-groups as IQ4_NL's
@@ -1272,6 +1275,63 @@ kernel void mm_scan6(device const uint* bcnt [[buffer(0)]], device uint* boff [[
     }
 }
 
+template <int F> struct SbHdr;
+template <> struct SbHdr<T_IQ2_S> {
+    float d;
+    ushort4 qh;
+    ushort4 sc;
+    static inline SbHdr load(device const uchar* bl) {
+        SbHdr h;
+        h.d = rdh(bl);
+        h.qh = ushort4(*(device const packed_ushort4*)(bl + 66));
+        h.sc = ushort4(*(device const packed_ushort4*)(bl + 74));
+        return h;
+    }
+    inline void decode(device const uchar* bl, int ib, int l, int hh, threadgroup const uint* tab,
+                       thread half4& a, thread half4& b) const {
+        const uint qhv = (qh[ib >> 1] >> (8 * (ib & 1))) & 0xFFu;
+        const uint scb = (sc[ib >> 1] >> (8 * (ib & 1))) & 0xFFu;
+        const uint qs4 = rd32(bl + 2 + 4 * ib);
+        const uint sg4 = rd32(bl + 34 + 4 * ib);
+        const uint i0 = ((qs4 >> (8 * l)) & 0xFFu) | ((qhv << (8 - 2 * l)) & 0x300u);
+        const uint i1 = ((qs4 >> (8 * (l + 2))) & 0xFFu) | ((qhv << (8 - 2 * (l + 2))) & 0x300u);
+        const uint s0 = (sg4 >> (8 * l)) & 0xFFu;
+        const uint s1 = (sg4 >> (8 * (l + 2))) & 0xFFu;
+        const float sc0 = d * (0.5f + float(scb & 15)) * 0.25f;
+        const float sc1 = d * (0.5f + float(scb >> 4)) * 0.25f;
+        a = w4_signed(g_iq2s(tab, i0, hh), hh ? s0 >> 4 : s0, sc0);
+        b = w4_signed(g_iq2s(tab, i1, hh), hh ? s1 >> 4 : s1, sc1);
+    }
+};
+template <> struct SbHdr<T_IQ3_S> {
+    float d;
+    ushort4 qh;
+    ushort2 sc;
+    static inline SbHdr load(device const uchar* bl) {
+        SbHdr h;
+        h.d = rdh(bl);
+        h.qh = ushort4(*(device const packed_ushort4*)(bl + 66));
+        h.sc = ushort2(*(device const packed_ushort2*)(bl + 106));
+        return h;
+    }
+    inline void decode(device const uchar* bl, int ib, int l, int hh, threadgroup const uint* tab,
+                       thread half4& a, thread half4& b) const {
+        const uint qhv = (qh[ib >> 1] >> (8 * (ib & 1))) & 0xFFu;
+        const uint scb = (sc[ib >> 2] >> (8 * ((ib >> 1) & 1))) & 0xFFu;
+        const float scv = d * float(1 + 2 * ((scb >> (4 * (ib & 1))) & 15));
+        const ushort4 q8 = ushort4(*(device const packed_ushort4*)(bl + 2 + 8 * ib));
+        const uint sh0 = hh ? (7 - 2 * l) : (8 - 2 * l);
+        const uint sh1 = hh ? (7 - 2 * (l + 2)) : (8 - 2 * (l + 2));
+        const uint i0 = ((q8[l] >> (8 * hh)) & 0xFFu) | ((qhv << sh0) & 256u);
+        const uint i1 = ((q8[l + 2] >> (8 * hh)) & 0xFFu) | ((qhv << sh1) & 256u);
+        const uint sg4 = rd32(bl + 74 + 4 * ib);
+        const uint s0 = (sg4 >> (8 * l)) & 0xFFu;
+        const uint s1 = (sg4 >> (8 * (l + 2))) & 0xFFu;
+        a = w4_signed(g_iq3s(tab, i0), hh ? s0 >> 4 : s0, scv);
+        b = w4_signed(g_iq3s(tab, i1), hh ? s1 >> 4 : s1, scv);
+    }
+};
+
 template <int F, int MS, int TN, int TK, int SG>
 kernel void mm_gu6(device const uchar* W [[buffer(0)]], device const half* XS [[buffer(1)]],
                    device half* HS [[buffer(2)]], device const int2* tiles [[buffer(3)]], constant MmArgs& a [[buffer(4)]],
@@ -1281,7 +1341,7 @@ kernel void mm_gu6(device const uchar* W [[buffer(0)]], device const half* XS [[
     threadgroup float ot[SG][TM * TN];
     threadgroup uint tab[fmt<F>::TAB];
     load_tab<F>(tab, tid, SG * 32);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!ctab) threadgroup_barrier(mem_flags::mem_threadgroup);
     const int2 tl = tiles[tg.y];
     const int e = tl.x & 0xFFFF, nsub = tl.x >> 16, row0 = tl.y, n0 = (int(tg.x) * SG + sg) * TN;
     device const uchar* E = W + ulong(e) * a.gu_stride;
@@ -1310,38 +1370,107 @@ kernel void mm_gu6(device const uchar* W [[buffer(0)]], device const half* XS [[
             if (MS > 2) { accg2[i] = 0.0f; accu2[i] = 0.0f; }
             if (MS > 3) { accg3[i] = 0.0f; accu3[i] = 0.0f; }
         }
-    for (int k0 = 0; k0 < int(a.n_embd); k0 += TK) {
-        const uint16_t cap = rg.get_capacity(), half_cap = cap / 2;
+    bool hoist_done = false;
+    if constexpr (TK == 32 && (F == T_IQ2_S || F == T_IQ3_S)) {
+        if (mm_hoist && (int(a.n_embd) & 255) == 0) {
+            hoist_done = true;
+            constexpr int NP = (TN * TK) / 256;
+            const uint16_t cap = rg.get_capacity(), half_cap = cap / 2;
+            device const uchar* gp[NP];
+            device const uchar* up[NP];
+            int ls[NP], hhs[NP], koffs[NP];
+            for (int p = 0; p < NP; ++p) {
+                const auto ix = rg.get_multidimensional_index(uint16_t(p * 4));
+                koffs[p] = ix[0];
+                ls[p] = (ix[0] & 31) >> 3;
+                hhs[p] = (ix[0] & 7) >> 2;
+                gp[p] = g0 + ulong(ix[1]) * a.gu_row;
+                up[p] = u0 + ulong(ix[1]) * a.gu_row;
+            }
+            for (int kb = 0; kb < int(a.n_embd); kb += 256) {
+                constexpr int BB = fmt<F>::BB;
+                const ulong boff = ulong(kb >> 8) * BB;
+                SbHdr<F> hg[NP], hu[NP];
+                for (int p = 0; p < NP; ++p) {
+                    hg[p] = SbHdr<F>::load(gp[p] + boff);
+                    hu[p] = SbHdr<F>::load(up[p] + boff);
+                }
+                for (int ib = 0; ib < 8; ++ib) {
+                    const int k0 = kb + ib * 32;
 #pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < half_cap; i += 4) {
-            const auto ix = rg.get_multidimensional_index(i);
-            const int k = k0 + ix[0], n = ix[1];
-            half4 wg, wu, wg2, wu2;
-            W8<F>::run(g0 + ulong(n) * a.gu_row, k, tab, wg, wg2);
-            W8<F>::run(u0 + ulong(n) * a.gu_row, k, tab, wu, wu2);
-            rg[i] = wg.x; rg[i + 1] = wg.y; rg[i + 2] = wg.z; rg[i + 3] = wg.w;
-            ru[i] = wu.x; ru[i + 1] = wu.y; ru[i + 2] = wu.z; ru[i + 3] = wu.w;
-            const uint16_t j = i + half_cap;
-            rg[j] = wg2.x; rg[j + 1] = wg2.y; rg[j + 2] = wg2.z; rg[j + 3] = wg2.w;
-            ru[j] = wu2.x; ru[j + 1] = wu2.y; ru[j + 2] = wu2.z; ru[j + 3] = wu2.w;
+                    for (int p = 0; p < NP; ++p) {
+                        const uint16_t i = uint16_t(p * 4);
+                        half4 wg, wu, wg2, wu2;
+                        if (koffs[p] < 16) {
+                            hg[p].decode(gp[p] + boff, ib, ls[p], hhs[p], tab, wg, wg2);
+                            hu[p].decode(up[p] + boff, ib, ls[p], hhs[p], tab, wu, wu2);
+                        } else {
+                            const int kk = k0 + koffs[p];
+                            wg = W4<F>::run(gp[p], kk, tab); wg2 = W4<F>::run(gp[p], kk + 16, tab);
+                            wu = W4<F>::run(up[p], kk, tab); wu2 = W4<F>::run(up[p], kk + 16, tab);
+                        }
+                        rg[i] = wg.x; rg[i + 1] = wg.y; rg[i + 2] = wg.z; rg[i + 3] = wg.w;
+                        ru[i] = wu.x; ru[i + 1] = wu.y; ru[i + 2] = wu.z; ru[i + 3] = wu.w;
+                        const uint16_t j = i + half_cap;
+                        rg[j] = wg2.x; rg[j + 1] = wg2.y; rg[j + 2] = wg2.z; rg[j + 3] = wg2.w;
+                        ru[j] = wu2.x; ru[j + 1] = wu2.y; ru[j + 2] = wu2.z; ru[j + 3] = wu2.w;
+                    }
+                    tA = tX.template slice<TK, TM>(k0, row0);
+                    op.run(tA, rg, accg0);
+                    op.run(tA, ru, accu0);
+                    if (MS > 1 && nsub > 1) {
+                        tA = tX.template slice<TK, TM>(k0, row0 + 16);
+                        op.run(tA, rg, accg1);
+                        op.run(tA, ru, accu1);
+                    }
+                    if (MS > 2 && nsub > 2) {
+                        tA = tX.template slice<TK, TM>(k0, row0 + 32);
+                        op.run(tA, rg, accg2);
+                        op.run(tA, ru, accu2);
+                    }
+                    if (MS > 3 && nsub > 3) {
+                        tA = tX.template slice<TK, TM>(k0, row0 + 48);
+                        op.run(tA, rg, accg3);
+                        op.run(tA, ru, accu3);
+                    }
+                }
+            }
         }
-        tA = tX.template slice<TK, TM>(k0, row0);
-        op.run(tA, rg, accg0);
-        op.run(tA, ru, accu0);
-        if (MS > 1 && nsub > 1) {
-            tA = tX.template slice<TK, TM>(k0, row0 + 16);
-            op.run(tA, rg, accg1);
-            op.run(tA, ru, accu1);
-        }
-        if (MS > 2 && nsub > 2) {
-            tA = tX.template slice<TK, TM>(k0, row0 + 32);
-            op.run(tA, rg, accg2);
-            op.run(tA, ru, accu2);
-        }
-        if (MS > 3 && nsub > 3) {
-            tA = tX.template slice<TK, TM>(k0, row0 + 48);
-            op.run(tA, rg, accg3);
-            op.run(tA, ru, accu3);
+    }
+    if (!hoist_done) {
+        for (int k0 = 0; k0 < int(a.n_embd); k0 += TK) {
+            const uint16_t cap = rg.get_capacity(), half_cap = cap / 2;
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < half_cap; i += 4) {
+                const auto ix = rg.get_multidimensional_index(i);
+                const int k = k0 + ix[0], n = ix[1];
+                half4 wg, wu, wg2, wu2;
+                W8<F>::run(g0 + ulong(n) * a.gu_row, k, tab, wg, wg2);
+                W8<F>::run(u0 + ulong(n) * a.gu_row, k, tab, wu, wu2);
+                rg[i] = wg.x; rg[i + 1] = wg.y; rg[i + 2] = wg.z; rg[i + 3] = wg.w;
+                ru[i] = wu.x; ru[i + 1] = wu.y; ru[i + 2] = wu.z; ru[i + 3] = wu.w;
+                const uint16_t j = i + half_cap;
+                rg[j] = wg2.x; rg[j + 1] = wg2.y; rg[j + 2] = wg2.z; rg[j + 3] = wg2.w;
+                ru[j] = wu2.x; ru[j + 1] = wu2.y; ru[j + 2] = wu2.z; ru[j + 3] = wu2.w;
+            }
+            tA = tX.template slice<TK, TM>(k0, row0);
+            op.run(tA, rg, accg0);
+            op.run(tA, ru, accu0);
+            if (MS > 1 && nsub > 1) {
+                tA = tX.template slice<TK, TM>(k0, row0 + 16);
+                op.run(tA, rg, accg1);
+                op.run(tA, ru, accu1);
+            }
+            if (MS > 2 && nsub > 2) {
+                tA = tX.template slice<TK, TM>(k0, row0 + 32);
+                op.run(tA, rg, accg2);
+                op.run(tA, ru, accu2);
+            }
+            if (MS > 3 && nsub > 3) {
+                tA = tX.template slice<TK, TM>(k0, row0 + 48);
+                op.run(tA, rg, accg3);
+                op.run(tA, ru, accu3);
+            }
         }
     }
     tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tO(ot[sg], dextents<int32_t, 2>(TN, TM));
@@ -1426,11 +1555,14 @@ kernel void mm_down6(device const uchar* W [[buffer(0)]], device const half* HS 
 #define MM6_DN(F) MMDN6(F, 2, 64, 32, 2) MMDN6(F, 3, 64, 32, 2) MMDN6(F, 4, 64, 32, 2) MMDN6(F, 4, 32, 32, 4) MMDN6(F, 4, 32, 32, 2)
 MM6_GU(T_Q4_K) MM6_GU(T_Q5_K)
 MM6_DN(T_Q5_1) MM6_DN(T_Q8_0)
+// M5 Ultra winners for IQ2_S / IQ3_S / IQ4_NL (plus baseline MS=4 fallback)
+MMGU6(T_IQ2_S, 2, 16, 32, 2) MMGU6(T_IQ3_S, 2, 16, 32, 2)
+MMDN6(T_IQ4_NL, 2, 64, 32, 2) MMDN6(T_IQ4_NL, 4, 32, 32, 4)
 // the other sets' types (UD-IQ4_XS-v31, IQ3_S): the one tile shape the engine uses (MS 4; gate/up TN 16, down TN 32, SG 4)
 #define MM6_GU1(F) MMGU6(F, 4, 16, 32, 4)
 #define MM6_DN1(F) MMDN6(F, 4, 32, 32, 4)
 MM6_GU1(T_Q6_K) MM6_GU1(T_Q8_0) MM6_GU1(T_IQ3_XXS) MM6_GU1(T_IQ2_S) MM6_GU1(T_IQ4_XS) MM6_GU1(T_IQ3_S) MM6_GU1(T_IQ2_XS) MM6_GU1(T_IQ2_XXS)
-MM6_DN1(T_Q5_0) MM6_DN1(T_IQ4_NL) MM6_DN1(T_Q2_0)
+MM6_DN1(T_Q5_0) MM6_DN1(T_Q2_0)
 #ifdef STRATA_KQ_DOWN
 MM6_DN1(T_Q4_K) MM6_DN1(T_Q5_K) MM6_DN1(T_Q6_K) MM6_DN1(T_Q3_K) MM6_DN1(T_IQ4_XS) MM6_DN1(T_IQ3_S)
 #endif

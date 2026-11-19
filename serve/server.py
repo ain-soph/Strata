@@ -10097,6 +10097,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         lazy = a.lazy or cfg.get("lazy_load") is True
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
+        vision_thread = None
+        vision_err = []
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -10114,8 +10116,18 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
                       'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
                       "encoder's GPU, or the first picture may not get it", flush=True)
+            parallel_vision = not lazy and not elastic and os.environ.get("STRATA_PARALLEL_VISION", "1") != "0"
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+                            env=vision_env(cfg, env), lazy=lazy or parallel_vision)
+            if parallel_vision:
+                vision._lazy = False
+                def _run_vision_start():
+                    try:
+                        vision._start()
+                    except BaseException as exc:
+                        vision_err.append(exc)
+                vision_thread = threading.Thread(target=_run_vision_start, daemon=True)
+                vision_thread.start()
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg, announce=False) if "args" in cfg else [])      # #1080
@@ -10170,6 +10182,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
             engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
+        if vision_thread is not None:
+            vision_thread.join()
+            if vision_err:
+                engine.close()
+                raise vision_err[0]
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

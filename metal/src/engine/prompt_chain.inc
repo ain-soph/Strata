@@ -14,6 +14,7 @@ namespace {
 constexpr int PC_QB = G_BUD, PC_QCHUNKS = G_QCHUNKS, PC_TM = 16;
 struct PcDqArgs { uint32_t n_in, n_out, row_bytes, perm; };
 struct PcGemmArgs { int M, N, K, pad; };
+struct PcDotArgs { uint32_t M, K; };
 struct PcEpiArgs { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PcGdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
 struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
@@ -77,17 +78,30 @@ bool Window::pc_setup(int C) {
                                         t == ref::IQ2_S || t == ref::IQ4_XS || t == ref::IQ3_S || t == ref::IQ2_XS || t == ref::IQ2_XXS; };
         auto dn_ok = [](int t) { return t == ref::Q5_1 || t == ref::Q8_0 || t == ref::Q5_0 || t == ref::IQ4_NL || t == ref::Q2_0 ||
                                         t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q3_K || t == ref::IQ4_XS || t == ref::IQ3_S; };   // (the last six: Q4-KQ, UD downs at widths divisible by 256)
-        bool types_ok = true;
+        bool types_ok = true, types_ok_m5u = true;
         for (int l = 0; l < G_NL && types_ok; ++l) {
             const std::string bl = "blk." + std::to_string(l) + ".";
-            types_ok = gu_ok(T(bl + "ffn_gate_exps.weight").type) && gu_ok(T(bl + "ffn_up_exps.weight").type) && dn_ok(T(bl + "ffn_down_exps.weight").type);
+            const int tg = T(bl + "ffn_gate_exps.weight").type, tu = T(bl + "ffn_up_exps.weight").type, td = T(bl + "ffn_down_exps.weight").type;
+            types_ok = gu_ok(tg) && gu_ok(tu) && dn_ok(td);
+            types_ok_m5u = types_ok_m5u && (tg == ref::IQ2_S || tg == ref::IQ3_S) && (tu == ref::IQ2_S || tu == ref::IQ3_S) && (td == ref::IQ4_NL);
         }
         const char* e6 = std::getenv("STRATA_PROMPT_V6");
         const int ms = types_ok ? (e6 ? std::atoi(e6) : 4) : 0;   // on by default (STRATA_PROMPT_V6=0 off, 2..4 = the group size)
         if (ms >= 2) {
             b.v6 = true; b.ms = std::min(ms, 4); b.tm = 16; b.gu3[0] = b.dn3[0] = 16;
-            if (!std::getenv("STRATA_PROMPT_GU")) { b.gu3[1] = 16; b.gu3[2] = 32; b.gu3[3] = 4; }   // measured (moe_mm_parity, T 2048): the accumulators of MS subtiles x gate/up need the narrow tile
-            if (!std::getenv("STRATA_PROMPT_DN")) { b.dn3[1] = 32; b.dn3[2] = 32; b.dn3[3] = 4; }
+            const bool m5u_on = cx_->device_name().rfind("Apple M5", 0) == 0 && types_ok_m5u &&
+                                !e6 && !std::getenv("STRATA_PROMPT_GU") && !std::getenv("STRATA_PROMPT_DN") &&
+                                !(std::getenv("STRATA_METAL_MOE_M5U") && std::string(std::getenv("STRATA_METAL_MOE_M5U")) == "0");
+            if (m5u_on) {
+                b.ms = 2;
+                b.gu3[1] = 16; b.gu3[2] = 32; b.gu3[3] = 2;
+                b.dn3[1] = 64; b.dn3[2] = 32; b.dn3[3] = 2;
+                b.ctab = metal_ctab();
+                b.hoist = !(std::getenv("STRATA_METAL_MOE_HOIST") && std::string(std::getenv("STRATA_METAL_MOE_HOIST")) == "0");
+            } else {
+                if (!std::getenv("STRATA_PROMPT_GU")) { b.gu3[1] = 16; b.gu3[2] = 32; b.gu3[3] = 4; }   // measured (moe_mm_parity, T 2048): the accumulators of MS subtiles x gate/up need the narrow tile
+                if (!std::getenv("STRATA_PROMPT_DN")) { b.dn3[1] = 32; b.dn3[2] = 32; b.dn3[3] = 4; }
+            }
         }
     }
     if (b.dn3[0] != b.tm) { std::fprintf(stderr, "strata metal: STRATA_PROMPT_GU/DN tile heights differ: using %d for both\n", b.tm); b.dn3[0] = b.tm; }
@@ -194,6 +208,10 @@ bool Window::pc_host_rows(const int64_t* tokens, int nT, int64_t pos0, const int
     const double t0 = now_ms();
     out.nT = nT;
     out.pos0 = pos0;
+    out.first_tok = nT > 0 ? tokens[0] : 0;
+    out.last_tok = nT > 0 ? tokens[nT - 1] : 0;
+    out.prev_in[0] = prev_in[0];
+    out.prev_in[1] = prev_in[1];
     out.ok = true;
     const gguf::Tensor& te = T("token_embd.weight");
     const size_t rb = ref::row_bytes(te.type, N);
@@ -230,7 +248,9 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     bool have = false;
     if (pc_next_.valid()) {
         cur = pc_next_.get();
-        have = cur.ok && cur.pos0 == pos0 && cur.nT == nT;
+        have = cur.ok && cur.pos0 == pos0 && cur.nT == nT &&
+               cur.first_tok == (nT > 0 ? tokens[0] : 0) && cur.last_tok == (nT > 0 ? tokens[nT - 1] : 0) &&
+               cur.prev_in[0] == ss.ple_prev[0] && cur.prev_in[1] == ss.ple_prev[1];
         if (have) b.hidden_ms += cur.ms;
     }
     if (have) { b.emb_ms += cur.ms_emb; b.ple_ms += cur.ms - cur.ms_emb; }
@@ -268,11 +288,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         ds.push_back(std::move(d));
     };
     auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
-        int tm = 64, tn = Nn <= 64 ? 32 : 64;
-        gemm_tile(cx_->device_name(), Nn, K, tm, tn);
-        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
+        int tm = 64, tn = Nn <= 64 ? 32 : 64, sg = 4;
+        gemm_tile(cx_->device_name(), M, Nn, K, tm, tn, sg);
+        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_" + std::to_string(sg);
         PcGemmArgs g{M, Nn, K, 0};
-        D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
+        D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 32 * sg);
     };
     auto dq = [&](const gguf::Tensor& t, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
         const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
@@ -414,8 +434,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         // ---- MoE
         hc_read(bl + "hc_ffn", true);
         const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
+        const gguf::Tensor& twsg = T(bl + "ffn_gate_inp_shexp.weight");
+        static const bool wdot_on = [] { const char* e = std::getenv("STRATA_METAL_W_DOT"); return !(e && std::string(e) == "0"); }();
+        const bool use_wdot = wdot_on && twsg.type == ref::F32;
         dq(T(bl + "ffn_gate_inp.weight"), b.Wr);
-        dq(T(bl + "ffn_gate_inp_shexp.weight"), b.Wsg);
+        if (!use_wdot) dq(twsg, b.Wsg);
         dq(T(bl + "ffn_gate_shexp.weight"), b.Wshg);
         dq(T(bl + "ffn_up_shexp.weight"), b.Wshu);
         dq(T(bl + "ffn_down_shexp.weight"), b.Wshd);
@@ -452,7 +475,9 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             const std::string fn = b.v6 ? "mm_gu6_" + std::to_string(eg.type) + "_" + std::to_string(b.ms) + "_" + std::to_string(b.gu3[1]) + "_" +
                                               std::to_string(b.gu3[2]) + "_" + std::to_string(b.gu3[3])
                                         : "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
-            gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
+            const bool hoist = b.v6 && b.hoist && (eg.type == ref::IQ2_S || eg.type == ref::IQ3_S);
+            const std::string key = fn + (b.ctab ? "#ct" : "") + (hoist ? "#hs" : "") + "#k4";
+            gu.p = P_(b.lib, fn, mtl::Constants().b(7, true).b(23, b.ctab).b(24, hoist), key);
         } else {
             const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
             gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
@@ -468,7 +493,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             const std::string fn = b.v6 ? "mm_down6_" + std::to_string(ed.type) + "_" + std::to_string(b.ms) + "_" + std::to_string(b.dn3[1]) + "_" +
                                               std::to_string(b.dn3[2]) + "_" + std::to_string(b.dn3[3])
                                         : "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
-            dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
+            const std::string key = fn + (b.ctab ? "#ct" : "") + "#k4";
+            dn.p = P_(b.lib, fn, mtl::Constants().b(7, true).b(23, b.ctab), key);
         } else {
             dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
         }
@@ -485,7 +511,13 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t nh = (uint32_t) nT * NFF;
         D(P_(b.lib, "swiglu_h"), {mtl::Arg::B(b.gsh), mtl::Arg::B(b.ush), mtl::Arg::B(b.hh), mtl::Arg::V(nh)}, (nh + 255) / 256, 1, 256);
         gemm(b.hh, b.Wshd, b.ys, nT, N, NFF);
-        gemm(b.mixh, b.Wsg, b.sgv, nT, 1, N);
+        if (use_wdot) {
+            PcDotArgs da{(uint32_t) nT, N};
+            D(P_(b.lib, "dot_f16_f32"), {mtl::Arg::B(b.mixh), mtl::Arg::B(W_, twsg.offset), mtl::Arg::B(b.sgv), mtl::Arg::V(da)},
+              (nT + 7) / 8, 1, 256);
+        } else {
+            gemm(b.mixh, b.Wsg, b.sgv, nT, 1, N);
+        }
         const uint32_t oa[2] = {(uint32_t) nT, N};
         D(P_(b.lib, "moe_out"), {mtl::Arg::B(b.yr), mtl::Arg::B(b.ys), mtl::Arg::B(b.sgv), mtl::Arg::B(b.bo), mtl::Arg::V(oa)},
           (nT * N + 255) / 256, 1, 256);
@@ -529,10 +561,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     if (hostpipe && next_tokens != nullptr && next_nT > 0 && g_embd_rows == nullptr) {
         const int32_t pv[2] = {nT >= 2 ? (int32_t) tokens[nT - 2] : ss.ple_prev[1], (int32_t) tokens[nT - 1]};
         const int64_t npos = pos0 + nT;
-        pc_next_ = std::async(std::launch::async, [this, next_tokens, next_nT, npos, pv0 = pv[0], pv1 = pv[1]] {
+        std::vector<int64_t> owned_next(next_tokens, next_tokens + next_nT);
+        pc_next_ = std::async(std::launch::async, [this, owned_next = std::move(owned_next), next_nT, npos, pv0 = pv[0], pv1 = pv[1]] {
             PcHost h;
             const int32_t pp[2] = {pv0, pv1};
-            pc_host_rows(next_tokens, next_nT, npos, pp, h);
+            pc_host_rows(owned_next.data(), next_nT, npos, pp, h);
             return h;
         });
     }
@@ -564,20 +597,31 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
 }
 
 bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
-                    const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
+                    const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                    const int64_t* hint_tokens, int64_t hint_n) {
     static const int C = [] {
         const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK");
         return std::max(64, std::min(8192, e ? std::atoi(e) : g_prompt_chunk_auto > 0 ? g_prompt_chunk_auto : 2048));
     }();
+    static const bool xcall_on = [] {
+        const char* e = std::getenv("STRATA_METAL_HOSTPIPE_XCALL");
+        return !(e && std::string(e) == "0");
+    }();
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
     pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = pb_.hidden_ms = pb_.emb_ms = pb_.ple_ms = 0;
-    struct MtpJoin { Window* w; ~MtpJoin() { w->mtp_wait(); w->pc_drain(); } } mtp_join{this};   // (every way out waits for the drafter's last rows)
+    bool keep_pc = false;
+    struct MtpJoin { Window* w; bool& keep_pc; ~MtpJoin() { w->mtp_wait(); if (!keep_pc) w->pc_drain(); } } mtp_join{this, keep_pc};   // (every way out waits for the drafter's last rows)
     for (int64_t c = 0; c < n; c += C) {
         const int nT = (int) std::min<int64_t>(C, n - c);
         if (pos0 + c + nT + 1 >= max_cells_) { err = "metal prompt: the prompt runs past the context"; return false; }
-        const int next_nT = (int) std::min<int64_t>(C, n - c - nT);
-        if (!pc_chunk(tokens + c, nT, pos0 + c, err, next_nT > 0 ? tokens + c + nT : nullptr, next_nT)) return false;
+        int next_nT = (int) std::min<int64_t>(C, n - c - nT);
+        const int64_t* next_ptr = next_nT > 0 ? tokens + c + nT : nullptr;
+        if (next_ptr == nullptr && xcall_on && hint_tokens != nullptr && hint_n > 0) {
+            next_nT = (int) std::min<int64_t>(C, hint_n);
+            next_ptr = hint_tokens;
+        }
+        if (!pc_chunk(tokens + c, nT, pos0 + c, err, next_ptr, next_nT)) return false;
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
@@ -588,6 +632,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
             if (!ok) return false;
         }
     }
+    if (xcall_on && hint_tokens != nullptr && hint_n > 0 && pc_next_.valid()) keep_pc = true;
     if (std::getenv("STRATA_METAL_TRACE") || std::getenv("STRATA_METAL_PROFILE"))
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms [+%.1f ms beside the GPU; embeddings %.1f, PLE %.1f], drafter rows %.1f ms) "
                              "-> %.1f tok/s\n", (long long) n, now_ms() - t0, pb_.gpu_ms, pb_.host_ms, pb_.hidden_ms, pb_.emb_ms, pb_.ple_ms, pb_.mtp_ms,

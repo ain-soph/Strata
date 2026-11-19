@@ -564,6 +564,16 @@ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
 
 namespace {
 bool g_cache_vmm = false;   // set_vmm
+#if defined(STRATA_GPU_METAL)
+bool metal_fast_load_ec() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS"); e && std::atoi(e) != 0) return false;
+        const char* e = std::getenv("STRATA_METAL_FAST_LOAD");
+        return !e || std::atoi(e) != 0;
+    }();
+    return on;
+}
+#endif
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
@@ -581,6 +591,31 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
 
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) {
+        if (cudaMalloc((void**) &base_, 4096) != cudaSuccess) {
+            base_ = nullptr;
+            err = "ExpertCache: placeholder alloc failed";
+            return false;
+        }
+        residency_.assign((size_t) (n_layers * n_expert), kNotResident);
+        slots_ = n_slots;
+        live_slots_ = n_slots;
+        n_layers_ = n_layers;
+        n_expert_ = n_expert;
+        blob_ = blob_bytes;
+        next_free_ = 0;
+        fills_ = 0;
+        admitted_ = 0;
+        layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+        for (int64_t l = 0; l < n_layers; ++l) {
+            int64_t lo = 0, hi = 0;
+            layer_slot_range(l, lo, hi);
+            layer_next_[(size_t) l] = (int32_t) lo;
+        }
+        return true;
+    }
+#endif
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
@@ -771,18 +806,31 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) return base_;
+#endif
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) return base_;
+#endif
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot", slot);
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) {
+        if (slot < 0 || slot >= slots_ || host_blob == nullptr) return false;
+        ++fills_;
+        return true;
+    }
+#endif
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -806,6 +854,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot_blocking", slot);
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) {
+        if (slot < 0 || slot >= slots_ || host_blob == nullptr) return false;
+        ++fills_;
+        return true;
+    }
+#endif
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -838,6 +893,13 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot_queued", slot);
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) {
+        if (slot < 0 || slot >= slots_ || host_blob == nullptr) return false;
+        ++fills_;
+        return true;
+    }
+#endif
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
@@ -856,6 +918,13 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
 
 bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
     if (sealed_) sealed_write("fill_slot_queued_parts", slot);
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) {
+        if (slot < 0 || slot >= slots_ || parts == nullptr || n <= 0) return false;
+        ++fills_;
+        return true;
+    }
+#endif
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || parts == nullptr || n <= 0) {
         err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
@@ -889,6 +958,9 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+#if defined(STRATA_GPU_METAL)
+    if (metal_fast_load_ec()) return slot >= 0 && slot < slots_;
+#endif
     const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {

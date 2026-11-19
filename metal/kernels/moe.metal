@@ -125,9 +125,7 @@ kernel void moe_plan(device const int* ids [[buffer(0)]], device const float* w 
 // One token's routing by one simdgroup: softmax over NL * 32 logits (512: NL 16; the 256-expert Coder: NL 8), top 10, weights.
 // `l` the token's logits, `ids` / `w` its 10 outputs.  NL = 16 is the original code token for token.
 template <int NL>
-static inline void route_tok(device const float* l, device int* ids, device float* w, ushort lane) {
-    float v[NL];
-    for (int i = 0; i < NL; ++i) v[i] = l[lane + 32 * i];
+static inline void route_tok_vals(thread float (&v)[NL], device int* ids, device float* w, ushort lane) {
     float mx = -INFINITY;
     for (int i = 0; i < NL; ++i) mx = max(mx, v[i]);
     for (ushort m = 16; m > 0; m >>= 1) mx = max(mx, simd_shuffle_xor(mx, m));
@@ -164,6 +162,13 @@ static inline void route_tok(device const float* l, device int* ids, device floa
     ssum = max(ssum, 6.103515625e-5f);
     const float inv = 1.0f / ssum;
     if (lane < ROUTE_K) w[lane] = selected * inv;
+}
+
+template <int NL>
+static inline void route_tok(device const float* l, device int* ids, device float* w, ushort lane) {
+    float v[NL];
+    for (int i = 0; i < NL; ++i) v[i] = l[lane + 32 * i];
+    route_tok_vals<NL>(v, ids, w, lane);
 }
 
 kernel void moe_route(device const float* logits [[buffer(0)]], device int* ids [[buffer(1)]],
@@ -464,6 +469,263 @@ DNK_SET(T_Q4_K) DNK_SET(T_Q5_K) DNK_SET(T_Q6_K) DNK_SET(T_Q3_K)
 // Gyro (agentionai's trellis experts): TQK6 / TQ2_T gate/up, TQK7 / TQ2_T down (the CUDA engine's STRATA_GU_FMTS / D_FMTS)
 GU_SET(T_TQK6) GU_SET(T_TQ2T)
 DN_SET(T_TQK7) DN_SET(T_TQ2T)
+
+// ---- Optimized streaming IQ2_S / IQ3_S gate/up decode kernels v2 (M5 Ultra) ----------------------------------------
+// Full-MLP upfront weight decode + 4-way parallel vector FMA (zero horizontal dot(), zero per-row q[UNIT] array),
+// aligned ushort/rd32 loads, branchless IEEE sign-bit OR, and optional threadgroup LUT (4 KB half4[512] for IQ3_S,
+// 8 KB ulong[1024] for IQ2_S). IQ_F16 (function constant 26) evaluates 4-weight vector FMAs in half4 while keeping
+// block scales and inter-unit accumulators in FP32.
+constant bool IQ_F16 [[function_constant(26)]];
+constant bool iq_f16 = is_function_constant_defined(IQ_F16) && IQ_F16;
+
+static inline half4 ld_tg_h4(threadgroup const half4* tg_h4, uint idx, uint s) {
+    const ushort4 b = as_type<ushort4>(tg_h4[idx]);
+    const ushort4 sgn = ushort4(ushort((s & 1u) << 15), ushort((s & 2u) << 14), ushort((s & 4u) << 13), ushort((s & 8u) << 12));
+    return as_type<half4>(b | sgn);
+}
+
+template <int NE, int USE_TG>
+static inline void iq2s_half(uint qsg, uint sgg, uint qhg, float dsg,
+                             uint qsu, uint sgu, uint qhu, float dsu,
+                             int h, int x_off, int n_embd, device const float* x, device const int* etok,
+                             thread float* ag, thread float* au, threadgroup const ulong* tg_u64) {
+    const uint sh0 = 8 - 4 * h, sh1 = 6 - 4 * h;
+    const uint ig0 = (qsg & 0xFFu) | ((qhg << sh0) & 0x300u);
+    const uint ig1 = ((qsg >> 8) & 0xFFu) | ((qhg << sh1) & 0x300u);
+    const uint iu0 = (qsu & 0xFFu) | ((qhu << sh0) & 0x300u);
+    const uint iu1 = ((qsu >> 8) & 0xFFu) | ((qhu << sh1) & 0x300u);
+    const ulong gp0 = USE_TG ? tg_u64[ig0] : iq2s_grid[ig0];
+    const ulong gp1 = USE_TG ? tg_u64[ig1] : iq2s_grid[ig1];
+    const ulong up0 = USE_TG ? tg_u64[iu0] : iq2s_grid[iu0];
+    const ulong up1 = USE_TG ? tg_u64[iu1] : iq2s_grid[iu1];
+    if (iq_f16) {
+        const half4 g0 = signed4_f16(uint(gp0), sgg),       g1 = signed4_f16(uint(gp0 >> 32), sgg >> 4);
+        const half4 g2 = signed4_f16(uint(gp1), sgg >> 8),  g3 = signed4_f16(uint(gp1 >> 32), sgg >> 12);
+        const half4 u0 = signed4_f16(uint(up0), sgu),       u1 = signed4_f16(uint(up0 >> 32), sgu >> 4);
+        const half4 u2 = signed4_f16(uint(up1), sgu >> 8),  u3 = signed4_f16(uint(up1 >> 32), sgu >> 12);
+        for (int t = 0; t < NE; ++t) {
+            device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+            const half4 x0 = half4(xt[0]), x1 = half4(xt[1]), x2 = half4(xt[2]), x3 = half4(xt[3]);
+            const half4 sg = fma(g0, x0, g2 * x2) + fma(g1, x1, g3 * x3);
+            const half4 su = fma(u0, x0, u2 * x2) + fma(u1, x1, u3 * x3);
+            ag[t] = fma(dsg, float(sg.x + sg.y) + float(sg.z + sg.w), ag[t]);
+            au[t] = fma(dsu, float(su.x + su.y) + float(su.z + su.w), au[t]);
+        }
+    } else {
+        const float4 g0 = signed4_f32(uint(gp0), sgg),       g1 = signed4_f32(uint(gp0 >> 32), sgg >> 4);
+        const float4 g2 = signed4_f32(uint(gp1), sgg >> 8),  g3 = signed4_f32(uint(gp1 >> 32), sgg >> 12);
+        const float4 u0 = signed4_f32(uint(up0), sgu),       u1 = signed4_f32(uint(up0 >> 32), sgu >> 4);
+        const float4 u2 = signed4_f32(uint(up1), sgu >> 8),  u3 = signed4_f32(uint(up1 >> 32), sgu >> 12);
+        for (int t = 0; t < NE; ++t) {
+            device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+            const float4 x0 = xt[0], x1 = xt[1], x2 = xt[2], x3 = xt[3];
+            const float4 sg = fma(g0, x0, g2 * x2) + fma(g1, x1, g3 * x3);
+            const float4 su = fma(u0, x0, u2 * x2) + fma(u1, x1, u3 * x3);
+            ag[t] = fma(dsg, (sg.x + sg.y) + (sg.z + sg.w), ag[t]);
+            au[t] = fma(dsu, (su.x + su.y) + (su.z + su.w), au[t]);
+        }
+    }
+}
+
+template <int NE, int USE_TG>
+static inline void iq3s_half(uint qsg, uint sgg, uint qhg, float dsg,
+                             uint qsu, uint sgu, uint qhu, float dsu,
+                             int h, int x_off, int n_embd, device const float* x, device const int* etok,
+                             thread float* ag, thread float* au, threadgroup const half4* tg_h4) {
+    const uint sh0 = 8 - 4 * h, sh1 = 7 - 4 * h, sh2 = 6 - 4 * h, sh3 = 5 - 4 * h;
+    const uint ig0 = (qsg & 0xFFu) | ((qhg << sh0) & 256u), ig1 = ((qsg >> 8) & 0xFFu) | ((qhg << sh1) & 256u);
+    const uint ig2 = ((qsg >> 16) & 0xFFu) | ((qhg << sh2) & 256u), ig3 = (qsg >> 24) | ((qhg << sh3) & 256u);
+    const uint iu0 = (qsu & 0xFFu) | ((qhu << sh0) & 256u), iu1 = ((qsu >> 8) & 0xFFu) | ((qhu << sh1) & 256u);
+    const uint iu2 = ((qsu >> 16) & 0xFFu) | ((qhu << sh2) & 256u), iu3 = (qsu >> 24) | ((qhu << sh3) & 256u);
+    if (USE_TG) {
+        const half4 hg0 = ld_tg_h4(tg_h4, ig0, sgg),       hg1 = ld_tg_h4(tg_h4, ig1, sgg >> 4);
+        const half4 hg2 = ld_tg_h4(tg_h4, ig2, sgg >> 8),  hg3 = ld_tg_h4(tg_h4, ig3, sgg >> 12);
+        const half4 hu0 = ld_tg_h4(tg_h4, iu0, sgu),       hu1 = ld_tg_h4(tg_h4, iu1, sgu >> 4);
+        const half4 hu2 = ld_tg_h4(tg_h4, iu2, sgu >> 8),  hu3 = ld_tg_h4(tg_h4, iu3, sgu >> 12);
+        if (iq_f16) {
+            for (int t = 0; t < NE; ++t) {
+                device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+                const half4 x0 = half4(xt[0]), x1 = half4(xt[1]), x2 = half4(xt[2]), x3 = half4(xt[3]);
+                const half4 sg = fma(hg0, x0, hg2 * x2) + fma(hg1, x1, hg3 * x3);
+                const half4 su = fma(hu0, x0, hu2 * x2) + fma(hu1, x1, hu3 * x3);
+                ag[t] = fma(dsg, float(sg.x + sg.y) + float(sg.z + sg.w), ag[t]);
+                au[t] = fma(dsu, float(su.x + su.y) + float(su.z + su.w), au[t]);
+            }
+        } else {
+            const float4 g0 = float4(hg0), g1 = float4(hg1), g2 = float4(hg2), g3 = float4(hg3);
+            const float4 u0 = float4(hu0), u1 = float4(hu1), u2 = float4(hu2), u3 = float4(hu3);
+            for (int t = 0; t < NE; ++t) {
+                device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+                const float4 x0 = xt[0], x1 = xt[1], x2 = xt[2], x3 = xt[3];
+                const float4 sg = fma(g0, x0, g2 * x2) + fma(g1, x1, g3 * x3);
+                const float4 su = fma(u0, x0, u2 * x2) + fma(u1, x1, u3 * x3);
+                ag[t] = fma(dsg, (sg.x + sg.y) + (sg.z + sg.w), ag[t]);
+                au[t] = fma(dsu, (su.x + su.y) + (su.z + su.w), au[t]);
+            }
+        }
+    } else {
+        const uint wg0 = iq3s_grid[ig0], wg1 = iq3s_grid[ig1], wg2 = iq3s_grid[ig2], wg3 = iq3s_grid[ig3];
+        const uint wu0 = iq3s_grid[iu0], wu1 = iq3s_grid[iu1], wu2 = iq3s_grid[iu2], wu3 = iq3s_grid[iu3];
+        if (iq_f16) {
+            const half4 g0 = signed4_f16(wg0, sgg),       g1 = signed4_f16(wg1, sgg >> 4);
+            const half4 g2 = signed4_f16(wg2, sgg >> 8),  g3 = signed4_f16(wg3, sgg >> 12);
+            const half4 u0 = signed4_f16(wu0, sgu),       u1 = signed4_f16(wu1, sgu >> 4);
+            const half4 u2 = signed4_f16(wu2, sgu >> 8),  u3 = signed4_f16(wu3, sgu >> 12);
+            for (int t = 0; t < NE; ++t) {
+                device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+                const half4 x0 = half4(xt[0]), x1 = half4(xt[1]), x2 = half4(xt[2]), x3 = half4(xt[3]);
+                const half4 sg = fma(g0, x0, g2 * x2) + fma(g1, x1, g3 * x3);
+                const half4 su = fma(u0, x0, u2 * x2) + fma(u1, x1, u3 * x3);
+                ag[t] = fma(dsg, float(sg.x + sg.y) + float(sg.z + sg.w), ag[t]);
+                au[t] = fma(dsu, float(su.x + su.y) + float(su.z + su.w), au[t]);
+            }
+        } else {
+            const float4 g0 = signed4_f32(wg0, sgg),       g1 = signed4_f32(wg1, sgg >> 4);
+            const float4 g2 = signed4_f32(wg2, sgg >> 8),  g3 = signed4_f32(wg3, sgg >> 12);
+            const float4 u0 = signed4_f32(wu0, sgu),       u1 = signed4_f32(wu1, sgu >> 4);
+            const float4 u2 = signed4_f32(wu2, sgu >> 8),  u3 = signed4_f32(wu3, sgu >> 12);
+            for (int t = 0; t < NE; ++t) {
+                device const float4* xt = (device const float4*)(x + etok[t] * n_embd + x_off);
+                const float4 x0 = xt[0], x1 = xt[1], x2 = xt[2], x3 = xt[3];
+                const float4 sg = fma(g0, x0, g2 * x2) + fma(g1, x1, g3 * x3);
+                const float4 su = fma(u0, x0, u2 * x2) + fma(u1, x1, u3 * x3);
+                ag[t] = fma(dsg, (sg.x + sg.y) + (sg.z + sg.w), ag[t]);
+                au[t] = fma(dsu, (su.x + su.y) + (su.z + su.w), au[t]);
+            }
+        }
+    }
+}
+
+template <int F, int LPR, int NE, int USE_TG>
+static inline void gu_opt_body(device const uchar* g0, device const uchar* u0, device const float* x,
+                               device float* h, device const int* etok, int c, int row0, int li, constant MoeArgs& a,
+                               threadgroup const half4* tg_h4, threadgroup const ulong* tg_u64) {
+    float ag[NE], au[NE];
+    for (int t = 0; t < NE; ++t) ag[t] = au[t] = 0.0f;
+    const int n_embd = int(a.n_embd);
+    if (LPR == 32) {
+        const int U = n_embd / 16;
+        for (int u = li; u < U; u += 32) {
+            const int sb = u >> 4, ui = u & 15, ib = ui >> 1, h_idx = ui & 1;
+            if (F == T_IQ2_S) {
+                device const uchar* bg = g0 + ulong(sb) * 82ul;
+                device const uchar* bu = u0 + ulong(sb) * 82ul;
+                const uint qsg = *(device const ushort*)(bg + 2 + 4 * ib + 2 * h_idx);
+                const uint sgg = *(device const ushort*)(bg + 34 + 4 * ib + 2 * h_idx);
+                const uint qhg = bg[66 + ib];
+                const float dsg = rdh(bg) * (0.5f + float((bg[74 + ib] >> (4 * h_idx)) & 15)) * 0.25f;
+                const uint qsu = *(device const ushort*)(bu + 2 + 4 * ib + 2 * h_idx);
+                const uint sgu = *(device const ushort*)(bu + 34 + 4 * ib + 2 * h_idx);
+                const uint qhu = bu[66 + ib];
+                const float dsu = rdh(bu) * (0.5f + float((bu[74 + ib] >> (4 * h_idx)) & 15)) * 0.25f;
+                iq2s_half<NE, USE_TG>(qsg, sgg, qhg, dsg, qsu, sgu, qhu, dsu, h_idx, 16 * u, n_embd, x, etok, ag, au, tg_u64);
+            } else {
+                device const uchar* bg = g0 + ulong(sb) * 110ul;
+                device const uchar* bu = u0 + ulong(sb) * 110ul;
+                const uint qsg = rd32(bg + 2 + 8 * ib + 4 * h_idx);
+                const uint sgg = *(device const ushort*)(bg + 74 + 4 * ib + 2 * h_idx);
+                const uint qhg = bg[66 + ib];
+                const float dsg = rdh(bg) * float(1 + 2 * ((bg[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+                const uint qsu = rd32(bu + 2 + 8 * ib + 4 * h_idx);
+                const uint sgu = *(device const ushort*)(bu + 74 + 4 * ib + 2 * h_idx);
+                const uint qhu = bu[66 + ib];
+                const float dsu = rdh(bu) * float(1 + 2 * ((bu[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+                iq3s_half<NE, USE_TG>(qsg, sgg, qhg, dsg, qsu, sgu, qhu, dsu, h_idx, 16 * u, n_embd, x, etok, ag, au, tg_h4);
+            }
+        }
+    } else {
+        // LPR == 16: one lane handles an entire 32-weight group (both h=0 and h=1), sharing block & scale loads.
+        const int U32 = n_embd / 32;
+        for (int u32 = li; u32 < U32; u32 += 16) {
+            const int sb = u32 >> 3, ib = u32 & 7;
+            if (F == T_IQ2_S) {
+                device const uchar* bg = g0 + ulong(sb) * 82ul;
+                device const uchar* bu = u0 + ulong(sb) * 82ul;
+                const uint qsg = rd32(bg + 2 + 4 * ib), sgg = rd32(bg + 34 + 4 * ib), qhg = bg[66 + ib], scg = bg[74 + ib];
+                const float dg_base = rdh(bg) * 0.25f;
+                const uint qsu = rd32(bu + 2 + 4 * ib), sgu = rd32(bu + 34 + 4 * ib), qhu = bu[66 + ib], scu = bu[74 + ib];
+                const float du_base = rdh(bu) * 0.25f;
+                iq2s_half<NE, USE_TG>(qsg & 0xFFFFu, sgg & 0xFFFFu, qhg, dg_base * (0.5f + float(scg & 15)),
+                                      qsu & 0xFFFFu, sgu & 0xFFFFu, qhu, du_base * (0.5f + float(scu & 15)),
+                                      0, 32 * u32, n_embd, x, etok, ag, au, tg_u64);
+                iq2s_half<NE, USE_TG>(qsg >> 16, sgg >> 16, qhg, dg_base * (0.5f + float(scg >> 4)),
+                                      qsu >> 16, sgu >> 16, qhu, du_base * (0.5f + float(scu >> 4)),
+                                      1, 32 * u32 + 16, n_embd, x, etok, ag, au, tg_u64);
+            } else {
+                device const uchar* bg = g0 + ulong(sb) * 110ul;
+                device const uchar* bu = u0 + ulong(sb) * 110ul;
+                const uint sgg = rd32(bg + 74 + 4 * ib), qhg = bg[66 + ib];
+                const float dsg = rdh(bg) * float(1 + 2 * ((bg[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+                const uint sgu = rd32(bu + 74 + 4 * ib), qhu = bu[66 + ib];
+                const float dsu = rdh(bu) * float(1 + 2 * ((bu[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+                const uint qsg0 = rd32(bg + 2 + 8 * ib), qsu0 = rd32(bu + 2 + 8 * ib);
+                iq3s_half<NE, USE_TG>(qsg0, sgg & 0xFFFFu, qhg, dsg, qsu0, sgu & 0xFFFFu, qhu, dsu,
+                                      0, 32 * u32, n_embd, x, etok, ag, au, tg_h4);
+                const uint qsg1 = rd32(bg + 6 + 8 * ib), qsu1 = rd32(bu + 6 + 8 * ib);
+                iq3s_half<NE, USE_TG>(qsg1, sgg >> 16, qhg, dsg, qsu1, sgu >> 16, qhu, dsu,
+                                      1, 32 * u32 + 16, n_embd, x, etok, ag, au, tg_h4);
+            }
+        }
+    }
+    for (int t = 0; t < NE; ++t) {
+        const float gv = lane_sum<LPR>(ag[t]), uv = lane_sum<LPR>(au[t]);
+        if (li == 0) h[(c + t) * int(a.n_ff) + row0] = gv / (1.0f + exp(-gv)) * uv;
+    }
+}
+
+template <int F, int LPR, int SG, int USE_TG>
+kernel void moe_gu_opt(device const uchar* W [[buffer(0)]], device const float* x [[buffer(1)]],
+                       device float* h [[buffer(2)]], device const int* plan [[buffer(3)]],
+                       constant MoeArgs& a [[buffer(4)]], device const float* xs16 [[buffer(5)]],
+                       device const uint* smap [[buffer(6)]], device const uchar* W1 [[buffer(7)]],
+                       device const uchar* W2 [[buffer(8)]], device const uchar* W3 [[buffer(9)]],
+                       uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+    (void)xs16;
+    threadgroup half4 tg_h4[(USE_TG && F == T_IQ3_S) ? 512 : 1];
+    threadgroup ulong tg_u64[(USE_TG && F == T_IQ2_S) ? 1024 : 1];
+    if (USE_TG && F == T_IQ3_S) {
+        for (int i = tid; i < 512; i += SG * 32) tg_h4[i] = half4(as_type<uchar4>(iq3s_grid[i]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (USE_TG && F == T_IQ2_S) {
+        for (int i = tid; i < 1024; i += SG * 32) tg_u64[i] = iq2s_grid[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int g = int(tg.y);
+    if (g >= plan[P_NG]) return;
+    constexpr int RG = 32 / LPR;
+    const int li = lane % LPR;
+    const int row0 = (int(tg.x) * SG + sg) * RG + lane / LPR;
+    const ulong ex = (ulong)plan[P_GEXP + g];
+    const int c = plan[P_GSTART + g], ne = plan[P_GSTART + g + 1] - c;
+    device const int* etok = plan + P_ETOK + c;
+    device const uchar* E = kArena ? arena_slot(smap[ex], W, W1, W2, W3) : W + ex * a.gu_stride;
+    device const uchar* g0 = E + a.gate_off + (ulong)row0 * a.gu_row;
+    device const uchar* u0 = E + a.up_off + (ulong)row0 * a.gu_row;
+    switch (ne) {
+        case 1: gu_opt_body<F, LPR, 1, USE_TG>(g0, u0, x, h, etok, c, row0, li, a, tg_h4, tg_u64); break;
+        case 2: gu_opt_body<F, LPR, 2, USE_TG>(g0, u0, x, h, etok, c, row0, li, a, tg_h4, tg_u64); break;
+        case 3: gu_opt_body<F, LPR, 3, USE_TG>(g0, u0, x, h, etok, c, row0, li, a, tg_h4, tg_u64); break;
+        case 4: gu_opt_body<F, LPR, 4, USE_TG>(g0, u0, x, h, etok, c, row0, li, a, tg_h4, tg_u64); break;
+        default:
+            for (int k = 0; k < ne; k += 4) {
+                const int m = min(4, ne - k);
+                if (m == 4) gu_opt_body<F, LPR, 4, USE_TG>(g0, u0, x, h, etok + k, c + k, row0, li, a, tg_h4, tg_u64);
+                else if (m == 3) gu_opt_body<F, LPR, 3, USE_TG>(g0, u0, x, h, etok + k, c + k, row0, li, a, tg_h4, tg_u64);
+                else if (m == 2) gu_opt_body<F, LPR, 2, USE_TG>(g0, u0, x, h, etok + k, c + k, row0, li, a, tg_h4, tg_u64);
+                else gu_opt_body<F, LPR, 1, USE_TG>(g0, u0, x, h, etok + k, c + k, row0, li, a, tg_h4, tg_u64);
+            }
+    }
+}
+
+#define GUO_(F, L, S, TG) template [[host_name("moe_gu_opt_" #F "_" #L "_1_" #S)]] kernel decltype(moe_gu_opt<F, L, S, TG>) moe_gu_opt<F, L, S, TG>;
+#define GUOT_(F, L, S) template [[host_name("moe_gu_opt_tg_" #F "_" #L "_1_" #S)]] kernel decltype(moe_gu_opt<F, L, S, 1>) moe_gu_opt<F, L, S, 1>;
+#define GUO(F, L, S) GUO_(F, L, S, 0)
+#define GUOT(F, L, S) GUOT_(F, L, S)
+GUO(T_IQ2_S, 32, 4) GUO(T_IQ2_S, 32, 8) GUO(T_IQ2_S, 16, 4) GUO(T_IQ2_S, 16, 8)
+GUO(T_IQ3_S, 32, 4) GUO(T_IQ3_S, 32, 8) GUO(T_IQ3_S, 16, 4) GUO(T_IQ3_S, 16, 8)
+GUOT(T_IQ2_S, 32, 4) GUOT(T_IQ2_S, 32, 8) GUOT(T_IQ2_S, 16, 4) GUOT(T_IQ2_S, 16, 8)
+GUOT(T_IQ3_S, 32, 4) GUOT(T_IQ3_S, 32, 8) GUOT(T_IQ3_S, 16, 4) GUOT(T_IQ3_S, 16, 8)
 
 #ifdef STRATA_METAL_F16   // window.cpp compiles it in only under STRATA_METAL_F16=1
 // ---- the fp16 path (STRATA_METAL_F16): x from the window's half plane, h also as half for the down

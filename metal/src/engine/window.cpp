@@ -87,11 +87,21 @@ static const char* gdn_scan_name(const std::string& device, int T) {
 // The M5 family's dense GEMM tiles for the prompt (bit-identical to the 64 x 64 tile: the tile only splits the output; measured on
 // an M5 Max, T = 2048 / 4096): the GDN out projection (N 2560, K 6144) 64 x 128 (1.17 -> 0.99 ms), the wide input projections
 // (N >= 6144) 128 x 64.  Other chips keep 64 x 64 (M4: no gain).  STRATA_METAL_GEMM_TILES=0 keeps the old tiles everywhere.
-static void gemm_tile(const std::string& device, int Nn, int K, int& tm, int& tn) {
+static void gemm_tile(const std::string& device, int M, int Nn, int K, int& tm, int& tn, int& sg) {
     static const bool off = [] { const char* e = std::getenv("STRATA_METAL_GEMM_TILES"); return e && std::string(e) == "0"; }();
     if (off || device.rfind("Apple M5", 0) != 0) return;
-    if (Nn == strata_metal::geo::N && K == strata_metal::geo::ZV) { tm = 64; tn = 128; }
-    else if (Nn >= 6144) { tm = 128; tn = 64; }
+    if (Nn == strata_metal::geo::LR + strata_metal::geo::HC && K == strata_metal::geo::HCD) {
+        tm = 16; tn = 64; sg = 2;
+    } else if (Nn == strata_metal::geo::N && K == strata_metal::geo::ZV) {
+        if (M >= 512) { tm = 128; tn = 32; sg = 4; }
+        else { tm = 64; tn = 128; sg = 4; }
+    } else if (Nn == strata_metal::geo::N && K == strata_metal::geo::NFF && M >= 512) {
+        tm = 128; tn = 64; sg = 8;
+    } else if (Nn == strata_metal::geo::QFULL && K == strata_metal::geo::N && M >= 1024) {
+        tm = 256; tn = 64; sg = 8;
+    } else if (Nn >= 6144) {
+        tm = 128; tn = 64; sg = 4;
+    }
 }
 // The four GDN input projections (qkv, z, alpha, beta) as ONE GEMM with a 16480 float output row (M5 family: 3.09 -> 2.87 ms a layer at
 // T = 2048; gdn_pre / gdn_post read the pieces at that stride, function constant 7).  Bit-identical to the separate GEMMs.
@@ -153,6 +163,36 @@ bool metal_ctab() {
     }();
     return on;
 }
+bool metal_combine_fuse() {
+    static const bool on = std::getenv("STRATA_METAL_COMBINE_FUSE") && std::string(std::getenv("STRATA_METAL_COMBINE_FUSE")) == "1";
+    return on;
+}
+bool metal_router_fuse() {
+    static const bool on = !(std::getenv("STRATA_METAL_ROUTER_FUSE") && std::string(std::getenv("STRATA_METAL_ROUTER_FUSE")) == "0");
+    return on;
+}
+bool metal_gr_opt() {
+    static const bool on = !(std::getenv("STRATA_METAL_GR_OPT") && std::string(std::getenv("STRATA_METAL_GR_OPT")) == "0");
+    return on;
+}
+int metal_iq_dec_opt() {
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_METAL_IQ_DEC_OPT");
+        return e ? std::atoi(e) : 3;
+    }();
+    return mode;
+}
+bool metal_iq_f16() {
+    static const bool on = std::getenv("STRATA_METAL_IQ_F16") && std::string(std::getenv("STRATA_METAL_IQ_F16")) == "1";
+    return on;
+}
+int metal_iq_tg() {
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_METAL_IQ_TG");
+        return e ? std::atoi(e) : 3;
+    }();
+    return mode;
+}
 // STRATA_METAL_F16=1 (opt-in): the decode windows' (resident model, with the head) dense GEMVs of Q2_0, the K-quants and IQ4_XS on the fp16 path -
 // the weights decoded into half, the window's x as half planes the writers of x add (function constant 25), the
 // products of a half unit summed in half, the scales and the units' sum in float (gemv.metal gemv16)
@@ -199,6 +239,7 @@ int xkind(int t) {
         default: return 0;
     }
 }
+bool needs_xprep_extra(int ty) { return xkind(ty) != 0 || ty == ref::Q5_1; }
 
 // a prepared activation: 4 planes of MAXT rows of n, then the per-16 sums
 struct Act {
@@ -219,6 +260,7 @@ struct PromptBufs {
     bool v3e = false;
     bool v6 = false;             // ragged expert tiles (mm_gu6 / mm_down6): groups of ms 16-row subtiles share one weight decode
     int ms = 1;
+    bool ctab = false, hoist = false;
     bool fused = false;          // the GDN input projections as one GEMM (gdn_fused_inputs)            // the M5's expert kernels (v3): not for the trellis types, which have only v2
     int C = 0, maxrows = 0, tm = 16;   // tm: the expert plan's tile height
     double gpu_ms = 0, host_ms = 0, mtp_ms = 0, hidden_ms = 0, emb_ms = 0, ple_ms = 0;   // hidden_ms: the host rows computed beside the GPU (pc_host_rows)
@@ -282,7 +324,7 @@ public:
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
-    bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, int64_t first_needed, std::string& err);
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,
                    float min_p, int* n_drafts, std::string& err);
     bool mtp_loaded() const { return mtp_on_; }
@@ -307,7 +349,8 @@ public:
     double df2_last_build_ms() const;
     // the prompt through mac-kern's prompt kernels (prompt_chain.inc)
     bool prompt(const int64_t* tokens, int64_t n, int64_t pos0,
-                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
+                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                const int64_t* hint_tokens = nullptr, int64_t hint_n = 0);
 
 private:
     const gguf::Tensor& T(const std::string& name) const {
@@ -348,7 +391,8 @@ private:
     void gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, size_t y_stride,
               int ntok, size_t y_off = 0, const mtl::Buffer* wb = nullptr);
     void xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n);
-    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok);
+    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok,
+                 bool raw_only = false, bool comb_prev = false);
     void layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0);
     void ple_cpu(int T);
     // the MTP layer: the input branches + attention HC read + K/V append for `n` rows (srcR rows, host tokens) at
@@ -431,7 +475,7 @@ private:
     // buffers
     mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
-        emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
+        emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_, rcnt_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
     mtl::Buffer h16_;   // STRATA_METAL_F16: the routed gate/up's h as half, for the down
     int cur_inj_ = 0;
@@ -653,6 +697,8 @@ private:
     struct PcHost {
         int nT = 0;
         int64_t pos0 = -1;
+        int64_t first_tok = 0, last_tok = 0;
+        int32_t prev_in[2] = {0, 0};
         std::vector<float> emb, ple;
         double ms = 0, ms_emb = 0;
         bool ok = true;
@@ -770,7 +816,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * G_CONV); z_ = A(4 * MAXT * G_ZV);
     al_ = A(4 * MAXT * G_HV); be_ = A(4 * MAXT * G_HV); yg_ = A(4 * MAXT * G_ZV); logits_ = A(4 * MAXT * 512);
-    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); h_ = A(4 * MAXT * TOPK * NFF);
+    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); h_ = A(4 * MAXT * TOPK * NFF);
     ye_ = A(4 * MAXT * TOPK * N); gsh_ = A(4 * MAXT * NFF); ush_ = A(4 * MAXT * NFF); ysh_ = A(4 * MAXT * N);
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * G_QFULL); kcur_ = A(4 * MAXT * G_KV); vcur_ = A(4 * MAXT * G_KV);
     iqr_ = A(4 * MAXT * G_IQR); ikr_ = A(4 * MAXT * G_ID); qcur_ = A(4 * MAXT * G_QOUT); qidx_ = A(4 * MAXT * G_IH * G_ID);
@@ -829,12 +875,31 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     // RoPE: cos/sin [pos][32] for the first 64 dims, NEOX pairs (i, i + 32), in double as build_rope_table
     const double base = f_.meta_num.count("qwen4exp.rope.freq_base") ? f_.meta_num["qwen4exp.rope.freq_base"] : 1e7;
-    for (int p = 0; p < MAXC + 16; ++p)
-        for (int i = 0; i < 32; ++i) {
-            const double th = (double) p * std::pow(base, -2.0 * i / 64.0);
-            cs_.as<float>()[(p * 32 + i) * 2] = (float) std::cos(th);
-            cs_.as<float>()[(p * 32 + i) * 2 + 1] = (float) std::sin(th);
+    double inv_freq[32];
+    for (int i = 0; i < 32; ++i) inv_freq[i] = std::pow(base, -2.0 * i / 64.0);
+    {
+        const int n_pos = (int) (MAXC + 16);
+        float* cs_ptr = cs_.as<float>();
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int nth = (int) std::min<unsigned>(8u, hw > 0 ? hw : 4u);
+        std::vector<std::thread> ths;
+        ths.reserve((size_t) (nth - 1));
+        auto fill_range = [&](int p0, int p1) {
+            for (int p = p0; p < p1; ++p)
+                for (int i = 0; i < 32; ++i) {
+                    const double th = (double) p * inv_freq[i];
+                    cs_ptr[(p * 32 + i) * 2] = (float) std::cos(th);
+                    cs_ptr[(p * 32 + i) * 2 + 1] = (float) std::sin(th);
+                }
+        };
+        const int chunk = (n_pos + nth - 1) / nth;
+        for (int t = 1; t < nth; ++t) {
+            const int p0 = t * chunk, p1 = std::min(n_pos, p0 + chunk);
+            if (p0 < p1) ths.emplace_back(fill_range, p0, p1);
         }
+        fill_range(0, std::min(n_pos, chunk));
+        for (auto& th : ths) th.join();
+    }
     for (int t = 0; t < MAXT; ++t)
         for (int c = 0; c < G_BUD; ++c) qids_.as<int>()[t * G_BUD + c] = c;
     for (int l = 0; l < G_NL; ++l) {
@@ -996,16 +1061,23 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
 
 // the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
 void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_,
-                     int ntok) {
+                     int ntok, bool raw_only, bool comb_prev) {
     const gguf::Tensor& tn = T(pre + "_norm.weight");
     const gguf::Tensor& tdn = T(pre + "_down.weight");
     const gguf::Tensor& tup = T(pre + "_up.weight");
     const gguf::Tensor& tin = final_ ? tdn : T(pre + "_inject.weight");
     GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
     mtl::Dispatch d1;
-    d1.p = P(lib_, k_norm(), {}, k_norm());
-    d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
-               mtl::Arg::V(a)};
+    if (apply && comb_prev) {
+        const uint32_t tk = TOPK;
+        d1.p = P(lib_, "gr_norm_comb", {}, "gr_norm_comb");
+        d1.args = {mtl::Arg::B(R_), mtl::Arg::B(ye_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                   mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::V(tk)};
+    } else {
+        d1.p = P(lib_, k_norm(), {}, k_norm());
+        d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
+                   mtl::Arg::V(a)};
+    }
     d1.grid[0] = HC;
     d1.grid[1] = ntok;
     d1.tg[0] = 256;
@@ -1033,7 +1105,11 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     push(ds, d2);
     mtl::Dispatch d3;
     const char* up = q8 ? (hcld ? "gr_upp_q8" : "gr_up_q8") : "gr_up";
-    d3.p = P(lib_, up, x16c(mtl::Constants().i(1, ntok)), x16k(std::string(up) + "#" + std::to_string(ntok)));
+    const bool raw = raw_only && metal_gr_opt() && !f16_enc_;
+    mtl::Constants uc = mtl::Constants().i(1, ntok);
+    if (raw) uc.b(27, true);
+    const std::string uk = std::string(up) + "#" + std::to_string(ntok) + (raw ? "#raw" : "");
+    d3.p = P(lib_, up, x16c(uc), x16k(uk));
     GrArgs au = a;
     au.n_tok = MAXT;   // the plane stride of the prepared activation
     d3.args = {mtl::Arg::B(*bu, ou), mtl::Arg::B(lo_), mtl::Arg::B(xn_), mtl::Arg::B(out.b), mtl::Arg::V(au)};
@@ -1075,7 +1151,15 @@ void Window::had_rows_ind(std::vector<mtl::Dispatch>& ds, int lib, const std::st
 void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0) {
     const std::string b = "blk." + std::to_string(l) + ".";
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
-    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    const bool is_gdn = l % G_QI != G_QI - 1;
+    const bool raw_attn = is_gdn
+        ? (!needs_xprep_extra(T(b + "attn_qkv.weight").type) && !needs_xprep_extra(T(b + "attn_gate.weight").type) &&
+           !needs_xprep_extra(T(b + "ssm_alpha.weight").type) && !needs_xprep_extra(T(b + "ssm_beta.weight").type))
+        : (!needs_xprep_extra(T(b + "attn_q.weight").type) && !needs_xprep_extra(T(b + "attn_k.weight").type) &&
+           !needs_xprep_extra(T(b + "attn_v.weight").type) && !needs_xprep_extra(T(b + "indexer.q_proj.weight").type) &&
+           !needs_xprep_extra(T(b + "indexer.k_proj.weight").type));
+    const bool comb_prev = l > 0 && !(l == 1 && ple_on_) && metal_combine_fuse() && !(taps_on_ && tap_slot_[l - 1] >= 0);
+    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok, raw_attn, comb_prev);
     if (l % G_QI != G_QI - 1) {
         const int gi = l - l / G_QI;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1207,30 +1291,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         gemv(ds, T(b + "attn_output.weight"), XQ_, bo_, N, ntok);
     }
     // ---- the MoE
-    gr_read(ds, b + "hc_ffn", true, XF_, false, ntok);
-    const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
-    gemv(ds, trt, XF_, logits_, 512, ntok);
-    nb_ = true;
-    if (stream_ && st_pred_ && l + 1 < G_NL) {   // the next layer's routing guessed from this layer's FFN input
-        nb_ = true;   // beside the router GEMV
-        gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
-             (size_t) l * MAXT * 512 * 4);
-        if (predL2_.ptr && l + 2 < G_NL) {
-            nb_ = true;
-            gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, 512, ntok,
-                 (size_t) l * MAXT * 512 * 4);
-        }
-        nb_ = true;
-    }
-    gemv(ds, T(b + "ffn_gate_shexp.weight"), XF_, gsh_, NFF, ntok);
-    nb_ = true;
-    gemv(ds, T(b + "ffn_up_shexp.weight"), XF_, ush_, NFF, ntok);
-    nb_ = true;
-    gemv(ds, T(b + "ffn_gate_inp_shexp.weight"), XF_, sg_, 1, ntok);
+    const gguf::Tensor &trt = T(b + "ffn_gate_inp.weight"),
+                       &tgs = T(b + "ffn_gate_shexp.weight"), &tus = T(b + "ffn_up_shexp.weight"),
+                       &tshinp = T(b + "ffn_gate_inp_shexp.weight"), &tds = T(b + "ffn_down_shexp.weight"),
+                       &tg_ = T(b + "ffn_gate_exps.weight"), &tu = T(b + "ffn_up_exps.weight"),
+                       &td = T(b + "ffn_down_exps.weight");
+    const bool raw_ffn = !needs_xprep_extra(trt.type) && !needs_xprep_extra(tgs.type) && !needs_xprep_extra(tus.type) &&
+                           !needs_xprep_extra(tshinp.type) && !needs_xprep_extra(tg_.type) && !needs_xprep_extra(tu.type);
+    gr_read(ds, b + "hc_ffn", true, XF_, false, ntok, raw_ffn, false);
+    const bool need_bo = (taps_on_ && tap_slot_[l] >= 0) || !metal_combine_fuse();
     {
         MoeArgs a{};
-        const gguf::Tensor &tg_ = T(b + "ffn_gate_exps.weight"), &tu = T(b + "ffn_up_exps.weight"),
-                           &td = T(b + "ffn_down_exps.weight");
         a.gate_off = tg_.offset;
         a.up_off = tu.offset;
         a.down_off = td.offset;
@@ -1250,56 +1321,121 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         a.topk = TOPK;
         a.n_expert = nexp_;
         const bool dq2 = td.type == ref::Q2_0;
-        // the trellis gate/up: 16 lanes a row, 2 rows a lane (expert_parity --bench --sweep, M4, TQK6, 10 experts: 166.6 us a layer
-        // against 174.5 for 32,2,4 and 196.8 for 32,1,4; also the fastest at 2 and 3 tokens)
         const bool tq_ = tg_.type >= 144;
         int gl = tq_ ? 16 : 32, gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
-        // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
-        // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
         int dl = dq2 || (m4 && td.type == ref::Q8_0) ? 8 : 4,
             dr = dq2 || (m4 && (td.type == ref::Q8_0 || td.type == ref::Q5_1 || td.type == ref::Q5_0)) ? 1 : 2;
-        {   // STRATA_METAL_MOE_GU=L,R,S / STRATA_METAL_MOE_DN=L,R,S (tile screens: lanes per row, rows per lane, simdgroups; an instantiated moe_gu_ / moe_down_ combination)
-            static const auto parse = [](const char* name, int* o) {
-                const char* e = std::getenv(name);
-                return e && std::sscanf(e, "%d,%d,%d", &o[0], &o[1], &o[2]) == 3;
-            };
-            static int gu_o[3], dn_o[3];
-            static const bool gu_e = parse("STRATA_METAL_MOE_GU", gu_o), dn_e = parse("STRATA_METAL_MOE_DN", dn_o);
-            if (gu_e && !tq_) { gl = gu_o[0]; gr = gu_o[1]; gs = gu_o[2]; }
-            if (dn_e && !dq2) { dl = dn_o[0]; dr = dn_o[1]; ds_ = dn_o[2]; }
-        }
+        static const auto parse = [](const char* name, int* o) {
+            const char* e = std::getenv(name);
+            return e && std::sscanf(e, "%d,%d,%d", &o[0], &o[1], &o[2]) == 3;
+        };
+        static int gu_o[3], dn_o[3];
+        static const bool gu_e = parse("STRATA_METAL_MOE_GU", gu_o), dn_e = parse("STRATA_METAL_MOE_DN", dn_o);
+        if (gu_e && !tq_) { gl = gu_o[0]; gr = gu_o[1]; gs = gu_o[2]; }
+        if (dn_e && !dq2) { dl = dn_o[0]; dr = dn_o[1]; ds_ = dn_o[2]; }
         const bool m16 = f16_enc_ && !stream_ && tg_.type == ref::Q2_0 && dq2 && !had_gu(l) && !had_dn(l);
+        const int iq_mode = metal_iq_dec_opt();
+        const bool iq_fmt_ok = (tg_.type == ref::IQ2_S && (iq_mode == 1 || iq_mode == 2)) ||
+                               (tg_.type == ref::IQ3_S && (iq_mode == 1 || iq_mode == 3));
+        const bool use_iq_gu = !m16 && !stream_ && iq_fmt_ok && tu.type == tg_.type &&
+                               (!gu_e || (gu_o[1] == 1 && (gu_o[0] == 16 || gu_o[0] == 32) && (gu_o[2] == 4 || gu_o[2] == 8)));
+        const bool use_iq_dn = false;
+        const int tg_mode = metal_iq_tg();
+        const bool use_tg_gu = use_iq_gu && ((tg_.type == ref::IQ2_S && (tg_mode == 1 || tg_mode == 2)) ||
+                                             (tg_.type == ref::IQ3_S && (tg_mode == 1 || tg_mode == 3)));
+        if (use_iq_gu && !gu_e) { gl = 16; gr = 1; gs = 4; }
         a.gx_gu = NFF / (gs * (32 / gl) * gr);
         a.gx_dn = N / (ds_ * (32 / dl) * dr);
-        mtl::Dispatch r;
-        r.p = P(lib_, "moe_route", {}, "moe_route");
-        r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
-        r.tg[0] = 512;
-        push(ds, r);
-        {
-            GlueArgs ga{NFF, MAXT, N, TOPK};
-            mtl::Dispatch d;
-            d.p = P(lib_, "swiglu_prep", x16c(), x16k("swiglu_prep"));
-            d.args = {mtl::Arg::B(gsh_), mtl::Arg::B(ush_), mtl::Arg::B(XH_.b), mtl::Arg::V(ga)};
-            d.grid[0] = NFF / 16;
-            d.grid[1] = ntok;
-            d.tg[0] = 16;
+
+        const bool can_rfuse = metal_router_fuse() && !stream_ && (trt.type == ref::F32 || trt.type == ref::BF16) &&
+                               tgs.type == ref::Q8_0 && tus.type == ref::Q8_0 && tds.type == ref::Q8_0 &&
+                               !f16_enc_ && !had_gu(l);
+        if (can_rfuse) {
+            GemvArgs ga{N, (uint32_t) nexp_, (uint32_t) ntok, (uint32_t) ref::row_bytes(trt.type, N), N, 512u};
+            const std::string rfn = "router_route_" + std::to_string(trt.type);
+            mtl::Dispatch rr;
+            rr.p = P(lib_, rfn, mtl::Constants().i(0, ntok), rfn + "#" + std::to_string(ntok));
+            rr.args = {mtl::Arg::B(W_, trt.offset), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(trt.type)),
+                       mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4), mtl::Arg::B(logits_), mtl::Arg::V(ga),
+                       mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(rcnt_)};
+            rr.grid[0] = (uint32_t) ((nexp_ + 15) / 16);
+            rr.tg[0] = 512;
+            push(ds, rr);
             nb_ = true;
-            push(ds, d);
+            {
+                GemvArgs gpa{N, NFF, (uint32_t) ntok, (uint32_t) ref::row_bytes(tgs.type, N), N, NFF};
+                const uint32_t rbu = (uint32_t) ref::row_bytes(tus.type, N);
+                mtl::Dispatch gp;
+                gp.p = P(lib_, "gemv_pair_8_8", mtl::Constants().i(0, ntok), "gemv_pair_8_8#" + std::to_string(ntok));
+                gp.args = {mtl::Arg::B(W_, tgs.offset), mtl::Arg::B(XF_.b, 0),
+                           mtl::Arg::B(W_, tus.offset), mtl::Arg::B(XF_.b, 0),
+                           mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4), mtl::Arg::B(XH_.b, 0),
+                           mtl::Arg::V(gpa), mtl::Arg::V(rbu)};
+                gp.grid[0] = (uint32_t) ((NFF + 3) / 4);
+                gp.tg[0] = 128;
+                push(ds, gp);
+            }
+            nb_ = true;
+            gemv(ds, tshinp, XF_, sg_, 1, ntok);
+        } else {
+            gemv(ds, trt, XF_, logits_, 512, ntok);
+            nb_ = true;
+            if (stream_ && st_pred_ && l + 1 < G_NL) {   // the next layer's routing guessed from this layer's FFN input
+                nb_ = true;   // beside the router GEMV
+                gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
+                     (size_t) l * MAXT * 512 * 4);
+                if (predL2_.ptr && l + 2 < G_NL) {
+                    nb_ = true;
+                    gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, 512, ntok,
+                         (size_t) l * MAXT * 512 * 4);
+                }
+                nb_ = true;
+            }
+            gemv(ds, tgs, XF_, gsh_, NFF, ntok);
+            nb_ = true;
+            gemv(ds, tus, XF_, ush_, NFF, ntok);
+            nb_ = true;
+            gemv(ds, tshinp, XF_, sg_, 1, ntok);
+            mtl::Dispatch r;
+            r.p = P(lib_, "moe_route", {}, "moe_route");
+            r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
+            r.tg[0] = 512;
+            push(ds, r);
+            {
+                GlueArgs ga{NFF, MAXT, N, TOPK};
+                mtl::Dispatch d;
+                d.p = P(lib_, "swiglu_prep", x16c(), x16k("swiglu_prep"));
+                d.args = {mtl::Arg::B(gsh_), mtl::Arg::B(ush_), mtl::Arg::B(XH_.b), mtl::Arg::V(ga)};
+                d.grid[0] = NFF / 16;
+                d.grid[1] = ntok;
+                d.tg[0] = 16;
+                nb_ = true;
+                push(ds, d);
+            }
         }
-        const std::string gun = std::string(m16 ? "moe_gu16_" : "moe_gu_") + std::to_string(tg_.type) + "_" + std::to_string(gl) +
-                                "_" + std::to_string(gr) + "_" + std::to_string(gs);
-        const std::string dnn = std::string(m16 ? "moe_down16_" : "moe_down_") + std::to_string(dq2 ? 142 : td.type) + "_" +
-                                std::to_string(dl) + "_" + std::to_string(dr) + "_" + std::to_string(ds_);
+        const std::string gun = m16
+            ? ("moe_gu16_" + std::to_string(tg_.type) + "_" + std::to_string(gl) + "_" + std::to_string(gr) + "_" + std::to_string(gs))
+            : (use_iq_gu ? std::string(use_tg_gu ? "moe_gu_opt_tg_" : "moe_gu_opt_")
+                         : std::string("moe_gu_")) +
+                  std::to_string(tg_.type) + "_" + std::to_string(gl) + "_" + std::to_string(gr) + "_" + std::to_string(gs);
+        const std::string dnn = m16
+            ? ("moe_down16_" + std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" + std::to_string(dr) + "_" + std::to_string(ds_))
+            : (use_iq_dn ? std::string("moe_down_opt_") : std::string("moe_down_")) +
+                  std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" + std::to_string(dr) + "_" + std::to_string(ds_);
         mtl::Dispatch g;
         const mtl::Buffer& EW = stream_ ? st_->chunk(0) : W_;
         // function constant 23 (QUANT_CTAB): the i-quant grids from constant memory, no threadgroup copy (same values)
         const bool ct = metal_ctab();
+        const bool iqf16 = metal_iq_f16();
         mtl::Constants ac = stream_ ? mtl::Constants().b(20, true) : mtl::Constants();
         ac.b(23, ct);
+        mtl::Constants ac_gu = ac;
+        if (use_iq_gu && iqf16) ac_gu.b(26, true);
+        mtl::Constants ac_dn = ac;
+        if (use_iq_dn && iqf16) ac_dn.b(26, true);
         const std::string ak = std::string(stream_ ? "#arena" : "") + (ct ? "#ct" : "");
-        g.p = m16 ? P(lib_, gun, {}, gun) : P(lib_, gun, ac, gun + ak);
+        g.p = m16 ? P(lib_, gun, {}, gun) : P(lib_, gun, ac_gu, gun + ak + (use_iq_gu && iqf16 ? "#if16" : ""));
         const bool hg = had_gu(l), hd = had_dn(l);
         if (hg) had_rows(ds, lib_, "d:", XF_.b, 0, XR_, 0, ntok, N, hsx_.handle ? &hsx_ : nullptr, false);   // before the host's turn
         g.args = {mtl::Arg::B(EW, ebase), hg ? mtl::Arg::B(XR_) : mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tg_.type)), mtl::Arg::B(h_),
@@ -1317,10 +1453,10 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         if (cuts_) cuts_->push_back((int) ds.size());   // the host's turn: this layer's experts put in place
         push(ds, g);
         nb_ = true;
-        gemv(ds, T(b + "ffn_down_shexp.weight"), XH_, ysh_, N, ntok);
+        gemv(ds, tds, XH_, ysh_, N, ntok);
         if (hd) had_rows(ds, lib_, "d:", h_, 0, h_, 0, ntok * TOPK, NFF, hsh_.handle ? &hsh_ : nullptr, false);   // H h, in place
         mtl::Dispatch dd;
-        dd.p = m16 ? P(lib_, dnn, {}, dnn) : P(lib_, dnn, ac, dnn + ak);
+        dd.p = m16 ? P(lib_, dnn, {}, dnn) : P(lib_, dnn, ac_dn, dnn + ak + (use_iq_dn && iqf16 ? "#if16" : ""));
         dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
         if (m16) dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h16_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
         if (stream_)
@@ -1331,7 +1467,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         dd.ind_off = P_IDN * 4;
         push(ds, dd);
     }
-    {
+    if (need_bo) {
         GlueArgs a{N, (uint32_t) ntok, N, TOPK};
         mtl::Dispatch d;
         d.p = P(lib_, k_comb(), {}, k_comb());
@@ -1406,6 +1542,7 @@ void Window::ple_cpu(int Tn) {
 }
 
 bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
+    pc_drain();
     mtp_src_ = nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
@@ -1498,9 +1635,16 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         const gguf::Tensor& tn = T("blk.1.hc_attn_norm.weight");
         GrArgs a{N, HC, LR, (uint32_t) Tn, 1u, eps_};
         mtl::Dispatch d1;
-        d1.p = P(lib_, k_norm(), {}, k_norm());
-        d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
-                   mtl::Arg::V(a)};
+        if (metal_combine_fuse() && !(taps_on_ && tap_slot_[0] >= 0)) {
+            const uint32_t tk = TOPK;
+            d1.p = P(lib_, "gr_norm_comb", {}, "gr_norm_comb");
+            d1.args = {mtl::Arg::B(R_), mtl::Arg::B(ye_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset),
+                       mtl::Arg::B(xn_), mtl::Arg::V(a), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::V(tk)};
+        } else {
+            d1.p = P(lib_, k_norm(), {}, k_norm());
+            d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
+                       mtl::Arg::V(a)};
+        }
         d1.grid[0] = HC;
         d1.grid[1] = Tn;
         d1.tg[0] = 256;
@@ -1532,7 +1676,9 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     for (int l = 1; l < G_NL; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    const bool raw_out = !needs_xprep_extra(T("output.weight").type);
+    const bool comb_last = metal_combine_fuse() && !(taps_on_ && tap_slot_[G_NL - 1] >= 0);
+    gr_read(ds, "output_hc", true, XA_, true, Tn, raw_out, comb_last);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -1561,6 +1707,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
 }
 
 bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
+    pc_drain();
     if (S < 1 || S > MAXT || S > max_t_) { err = "metal window: batch window size out of range"; return false; }
     if (active_ != 0) activate(0);
     uint32_t* ri = rinfo_.as<uint32_t>() + 8;
@@ -1847,7 +1994,7 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
         };
         if (c.rfind("moe_gu", 0) == 0) part = "experts gate+up";
         else if (c.rfind("moe_down", 0) == 0) part = "experts down";
-        else if (c.rfind("moe_route", 0) == 0) part = "router";
+        else if (c.rfind("moe_route", 0) == 0 || c.rfind("router_route", 0) == 0) { part = "router"; wb = c.rfind("router_route", 0) == 0 ? tsize(0) : 0; }
         else if (c.rfind("moe_combine", 0) == 0) part = "combine";
         else if (c.rfind("gr_", 0) == 0) { part = "hc"; wb = c.rfind("gr_down", 0) == 0 ? tsize(0) + tsize(1) : c.rfind("gr_up", 0) == 0 ? tsize(0) : 0; }
         else if (c.rfind("gdn_", 0) == 0) part = "gdn other";
@@ -1856,6 +2003,7 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
         else if (c.rfind("argmax", 0) == 0) part = "lm head (argmax)";
         else if (c.rfind("swiglu_prep", 0) == 0) part = "shared";
         else if (c.rfind("xprep", 0) == 0) part = "xprep";
+        else if (c.rfind("gemv_pair", 0) == 0) { part = "shared"; wb = tsize(0) + tsize(2); }
         else if (c.rfind("gemv", 0) == 0 && t0) {
             wb = tsize(0);
             if (tn == "attn_qkv.weight" || tn == "attn_gate.weight" || tn == "ssm_alpha.weight" || tn == "ssm_beta.weight" || tn == "ssm_out.weight") part = "gdn dense";
@@ -1876,7 +2024,7 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
     // the route dispatches (one per layer): the prefix that ends right after one holds that layer's routed ids
     std::vector<size_t> routes;
     for (size_t i = 0; i < n; ++i)
-        if (pname.count(ds[i].p) && pname[ds[i].p].rfind("moe_route", 0) == 0) routes.push_back(i);
+        if (pname.count(ds[i].p) && (pname[ds[i].p].rfind("moe_route", 0) == 0 || pname[ds[i].p].rfind("router_route", 0) == 0)) routes.push_back(i);
     const int reps = std::getenv("STRATA_METAL_STEPPROF_REPS") ? std::max(1, std::atoi(std::getenv("STRATA_METAL_STEPPROF_REPS"))) : 5;
     std::fprintf(stderr, "strata metal stepprof: T%d, %zu dispatches in %zu barrier groups, %zu layers routed, %d reps per prefix\n", Tn, n, m, routes.size(), reps);
     for (int i = 0; i < 40; ++i) cx_->run_graph(ds);   // clocks up
@@ -1956,6 +2104,8 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
 }
 
 Window::~Window() {
+    pc_drain();
+    mtp_wait();
     df2_free();
     if (logpos_) std::fclose(logpos_);
     print_prof();
@@ -2118,6 +2268,22 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
     if (real) o.ple_hist.assign(ple_hist_.size(), 0.0f);
 }
 
+static void bind_qsa(strata::core::QsaState& st, const mtl::Buffer& kq, const mtl::Buffer& vq, const mtl::Buffer& ksc,
+                     const mtl::Buffer& vsc, const mtl::Buffer* pooled, const mtl::Buffer* tail, const mtl::Buffer* dead,
+                     int64_t cells) {
+    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+    st.kv_int8 = true; st.kv_q4 = false; st.kv_hybrid = false; st.kv_rot = false;
+    st.k_q = (int8_t*) kq.ptr; st.v_q = (int8_t*) vq.ptr;
+    st.k_scale = (uint16_t*) ksc.ptr; st.v_scale = (uint16_t*) vsc.ptr;
+    st.k_pool = nullptr; st.v_pool = nullptr;
+    st.kv_mode = 0;
+    st.n_pages = cells / page; st.n_slots = st.n_pages;
+    st.max_cells = std::min<int64_t>(st.max_cells > 0 ? st.max_cells : cells, st.n_pages * page);
+    if (pooled) { st.idx_pooled = (float*) pooled->ptr; st.idx_pooled_rows = (int64_t) (pooled->bytes / (G_ID * 4)); }
+    if (tail) st.idx_tail = (float*) tail->ptr;
+    if (dead) st.idx_dead = (float*) dead->ptr;
+}
+
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
@@ -2132,6 +2298,11 @@ bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, s
         auto x = std::make_unique<SeqSet>();
         alloc_set(*x, true, (int) b + 1);
         x->ss = slots[b];
+        if (slots[b] && slots[b]->qsa_states && slots[b]->qsa_alloc == (int64_t) x->kq.size() && slots[b]->qsa_ord0 == 0) {
+            for (size_t j = 0; j < x->kq.size(); ++j)
+                bind_qsa(slots[b]->qsa_states[j], x->kq[j], x->vq[j], x->ksc[j], x->vsc[j],
+                         &x->pooled[j], &x->tail[j], &x->dead[j], max_cells_);
+        }
         for (auto* vec : {&x->gst, &x->gh0, &x->gh1, &x->kq, &x->vq, &x->ksc, &x->vsc, &x->tail, &x->dead, &x->pooled})
             for (const auto& bf : *vec) bytes += bf.bytes;
         set_of_ss_[slots[b]] = (int) b + 1;
@@ -2158,6 +2329,7 @@ void Window::activate(int set) {
 }
 
 bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
+    pc_drain();
     if (sets_.empty()) { err = "metal window: no batch slots"; return false; }
     static const bool one_window = !(std::getenv("STRATA_METAL_BATCH_ROWS") && std::string(std::getenv("STRATA_METAL_BATCH_ROWS")) == "0");
     if (one_window && bigs_ok_) {
@@ -2177,6 +2349,7 @@ bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int6
 }
 
 bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err) {
+    pc_drain();
     if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
     activate(0);
     SeqSet& o = *sets_[(size_t) b + 1];
@@ -2212,22 +2385,6 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
 }
 
 namespace { strata::core::QsaState* g_draft_state = nullptr; }   // the drafter's QsaState (MtpDrafter::kv_state), bound once the window has the draft layer
-
-static void bind_qsa(strata::core::QsaState& st, const mtl::Buffer& kq, const mtl::Buffer& vq, const mtl::Buffer& ksc,
-                     const mtl::Buffer& vsc, const mtl::Buffer* pooled, const mtl::Buffer* tail, const mtl::Buffer* dead,
-                     int64_t cells) {
-    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
-    st.kv_int8 = true; st.kv_q4 = false; st.kv_hybrid = false; st.kv_rot = false;
-    st.k_q = (int8_t*) kq.ptr; st.v_q = (int8_t*) vq.ptr;
-    st.k_scale = (uint16_t*) ksc.ptr; st.v_scale = (uint16_t*) vsc.ptr;
-    st.k_pool = nullptr; st.v_pool = nullptr;
-    st.kv_mode = 0;
-    st.n_pages = cells / page; st.n_slots = st.n_pages;
-    st.max_cells = std::min<int64_t>(st.max_cells > 0 ? st.max_cells : cells, st.n_pages * page);
-    if (pooled) { st.idx_pooled = (float*) pooled->ptr; st.idx_pooled_rows = (int64_t) (pooled->bytes / (G_ID * 4)); }
-    if (tail) st.idx_tail = (float*) tail->ptr;
-    if (dead) st.idx_dead = (float*) dead->ptr;
-}
 
 void Window::bind_session(strata::core::SessionState& ss) {
     if (!ss.qsa_states) return;
@@ -2275,6 +2432,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
 }
 
 void Window::reset() {
+    pc_drain();
     pend_fold_ = 0;
     last_T_ = 0;
     auto zero = [](const mtl::Buffer& b, size_t n) { std::memset(b.ptr, 0, n); };
@@ -2295,6 +2453,7 @@ void Window::reset() {
 }
 
 bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
+    pc_drain();
     const size_t gs = GST_B, hs = HIST_B, ts = 3 * 4 * G_ID, tsw = TAIL_B, dsz = DEAD_B;
     if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) PLEH_B ||
         (c.tails.size() != tail_.size() * ts && c.tails.size() != tail_.size() * tsw) || c.dead.size() != dead_.size() * dsz) {
@@ -2739,23 +2898,26 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
 }
 
 // the prompt's K/V: cell cell0 + i pairs the main window's final residual row i with the token at cell0 + i + 1
-bool Window::mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+bool Window::mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, int64_t first_needed, std::string& err) {
     if (!mtp_on_) { err = "metal mtp: not loaded"; return false; }
+    const int64_t start = std::max<int64_t>(0, first_needed - cell0);
+    if (start >= n) return true;
     mtp_wait();   // (the previous chunk's rows share the cache, the scratch and the embedding rows)
-    mrope_sync(cell0, n);
+    const int64_t count = n - start;
+    mrope_sync(cell0 + start, count);
     // every group of MAXT rows in one command buffer: the embedding rows of all of them in mpemb_ (row c + i)
-    if ((int64_t) mpemb_rows_ < n) {
+    if ((int64_t) mpemb_rows_ < count) {
         if (mpemb_rows_ > 0) cx_->free(mpemb_);
-        mpemb_rows_ = (size_t) std::max<int64_t>(n, 64);
+        mpemb_rows_ = (size_t) std::max<int64_t>(count, 64);
         mpemb_ = cx_->alloc(4 * mpemb_rows_ * N);
     }
     membp_ = &mpemb_;
     std::vector<mtl::Dispatch> ds;
     nb_ = false;
-    for (int64_t c = 0; c < n; c += MAXT) {
+    for (int64_t c = start; c < n; c += MAXT) {
         const int k = (int) std::min<int64_t>(MAXT, n - c);
         mtp_encode(ds, mpsrc_ ? *mpsrc_ : mtp_src_ ? *mtp_src_ : R_, (size_t) c * HC * N * 4, k, next_tokens + c,
-                   cell0 + c, false, (int) c, 0);
+                   cell0 + c, false, (int) (c - start), 0);
     }
     membp_ = nullptr;
     if (mtp_ovl_ && mpsrc_ == &pb_.R && pb_.R2.handle != nullptr && !mrope_on()) mtp_async_ = cx_->run_graph_async(ds);
@@ -3001,6 +3163,7 @@ bool Window::prompt_gemm_init(std::string& err) {
 }
 
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
+    pc_drain();
     PromptGemm& p = *pg_;
     p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
     p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
@@ -3601,21 +3764,25 @@ bool mtp_load_pending(Window* w, std::string& err) {
 // Prefill::run's Metal side: the prompt read through the window, MAXT rows at a time (no head), each window
 // committed; on_chunk (the MTP's K/V) after each, with the window's final residual rows in place.
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
-                     const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
+                     const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                     const int64_t* hint_tokens = nullptr, int64_t hint_n = 0);
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
-                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
+                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                const int64_t* hint_tokens = nullptr, int64_t hint_n = 0) {
     struct Rows {
         explicit Rows(const float* const* r) { g_embd_rows = r; }
         ~Rows() { g_embd_rows = nullptr; }
     } rows(embd_rows);
-    return prompt_run_rows(tokens, n, pos0, on_chunk, err);
+    return prompt_run_rows(tokens, n, pos0, on_chunk, err, hint_tokens, hint_n);
 }
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
-                     const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
+                     const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err,
+                     const int64_t* hint_tokens, int64_t hint_n) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
-    if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
+    if (!windows && !g_window->streaming() && n >= min_rows)
+        return g_window->prompt(tokens, n, pos0, on_chunk, err, hint_tokens, hint_n);
     if (!windows && g_window->streaming()) {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
@@ -3645,9 +3812,9 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
     }
     return true;
 }
-bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, int64_t first_needed, std::string& err) {
     if (g_window == nullptr) { err = "metal mtp: no decode window"; return false; }
-    return g_window->mtp_prefill(next_tokens, n, cell0, err);
+    return g_window->mtp_prefill(next_tokens, n, cell0, first_needed, err);
 }
 bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs, float min_p,
                int* n_drafts, std::string& err) {

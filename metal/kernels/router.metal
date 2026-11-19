@@ -5,12 +5,19 @@
 // the counter.  No threadgroup waits for another.  ids / w / plan are bitwise moe_route's.
 // Buffers: W, xp, s16, logits, args (GemvArgs: n_out = n_expert), ids, w, plan, MoeArgs, counter (one uint, zero).
 
-static inline void route_body(device const float* logits, device int* ids, device float* w, device int* plan,
+template <int NL>
+static inline void route_tok_coh(device coherent(device) const float* l, device int* ids, device float* w, ushort lane) {
+    float v[NL];
+    for (int i = 0; i < NL; ++i) v[i] = l[lane + 32 * i];
+    route_tok_vals<NL>(v, ids, w, lane);
+}
+
+static inline void route_body(device coherent(device) const float* logits, device int* ids, device float* w, device int* plan,
                               constant MoeArgs& a, ushort tid, ushort nth, ushort sg, ushort lane, threadgroup int* s_grp,
                               threadgroup int* s_ent) {
     if (sg < a.n_tok) {   // (route_tok: moe.metal; 512 experts: NL 16, the 256-expert Coder: NL 8)
-        if (a.n_expert == 256) route_tok<8>(logits + sg * 512, ids + sg * ROUTE_K, w + sg * ROUTE_K, lane);
-        else route_tok<16>(logits + sg * 512, ids + sg * ROUTE_K, w + sg * ROUTE_K, lane);
+        if (a.n_expert == 256) route_tok_coh<8>(logits + sg * 512, ids + sg * ROUTE_K, w + sg * ROUTE_K, lane);
+        else route_tok_coh<16>(logits + sg * 512, ids + sg * ROUTE_K, w + sg * ROUTE_K, lane);
     }
     threadgroup_barrier(mem_flags::mem_device);
     plan_body(ids, w, plan, a, tid, nth, sg, lane, s_grp, s_ent);
@@ -18,7 +25,7 @@ static inline void route_body(device const float* logits, device int* ids, devic
 
 template <int F>
 kernel void router_route(device const uchar* W [[buffer(0)]], device const float* xp [[buffer(1)]],
-                         device const float* s16 [[buffer(2)]], device float* logits [[buffer(3)]],
+                         device const float* s16 [[buffer(2)]], device coherent(device) float* logits [[buffer(3)]],
                          constant GemvArgs& ga [[buffer(4)]], device int* ids [[buffer(5)]], device float* w [[buffer(6)]],
                          device int* plan [[buffer(7)]], constant MoeArgs& a [[buffer(8)]],
                          device atomic_uint* counter [[buffer(9)]],
@@ -29,8 +36,10 @@ kernel void router_route(device const uchar* W [[buffer(0)]], device const float
     threadgroup uint tab[fmt<F>::TAB];
     threadgroup int s_grp[32], s_ent[32];
     threadgroup uint last;
-    load_tab<F>(tab, tid, nth);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (fmt<F>::TAB > 1) {
+        load_tab<F>(tab, tid, nth);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     // the GEMV: simdgroup sg -> row tg.x * 16 + sg, 32 lanes over its units
     const int row = int(tgx) * 16 + sg;
     const int rr = min(row, int(ga.n_out) - 1);
@@ -52,14 +61,16 @@ kernel void router_route(device const uchar* W [[buffer(0)]], device const float
         const float v = lane_sum<32>(acc[t]);
         if (lane == 0 && row < int(ga.n_out)) logits[t * int(ga.y_stride) + row] = v;
     }
-    // the last threadgroup to finish routes
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    // All threads commit their device writes BEFORE tid==0 fences and signals completion.
     threadgroup_barrier(mem_flags::mem_device);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     if (tid == 0) last = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed) == ngx - 1 ? 1u : 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!last) return;
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device);
     route_body(logits, ids, w, plan, a, tid, nth, sg, lane, s_grp, s_ent);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 }
 

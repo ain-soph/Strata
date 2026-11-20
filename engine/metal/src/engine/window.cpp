@@ -331,8 +331,9 @@ public:
     // slot b's state <-> the main one (the GPU is idle between windows): the running state and the first `upto` cells of K/V
     bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
     void activate(int set);
-    bool compact_slots() const { return compact_slot_ >= 0; }
+    bool compact_slots() const { return compact_state_ >= 0; }
     void select_main_slot(int slot);
+    void exchange_slots(int a, int b);
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
@@ -532,10 +533,11 @@ private:
     std::vector<std::unique_ptr<SeqSet>> sets_;     // [0] the spare the main state is exchanged with, [b + 1] slot b
     std::map<const strata::core::SessionState*, int> set_of_ss_;
     int active_ = 0;
-    int compact_slot_ = -1;   // physical backing of logical set 0 in compact mode
+    int compact_state_ = -1;   // physical backing of logical set 0 in compact mode
+    std::array<int, 2> compact_backing_{0, 1};
     int physical_set(int logical) const {
         if (!compact_slots()) return logical;
-        return logical == 0 ? compact_slot_ : logical - 1;
+        return logical == 0 ? compact_state_ : compact_backing_[(size_t) logical - 1];
     }
     void swap_state(SeqSet& o);
     void alloc_set(SeqSet& o, bool real, int idx = 0);
@@ -872,7 +874,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     mrope_ = A(12 * (size_t) (MAXC + 16));
     bigs_ok_ = g_slot_cap > 0;
     const char* compact = std::getenv("STRATA_METAL_COMPACT_BATCH");
-    if (g_slot_cap == 2 && compact && std::string(compact) == "1") compact_slot_ = 0;
+    if (g_slot_cap == 2 && compact && std::string(compact) == "1") compact_state_ = 0;
     const size_t NSET = (size_t) std::max(0, g_slot_cap) + (compact_slots() ? 0 : 1);
     if (compact_slots())
         std::fprintf(stderr, "strata metal: compact batch uses %zu physical sequence states\n", NSET);
@@ -2435,7 +2437,8 @@ void Window::select_main_slot(int slot) {
     pc_drain();
     pc_next_ = {};
     mtp_wait();
-    if (slot == compact_slot_) return;
+    const int physical = physical_set(slot + 1);
+    if (physical == compact_state_) return;
     activate(0);
     const SeqSet& backing = *sets_[(size_t) slot + 1];
     gst_ = backing.gst;
@@ -2449,8 +2452,18 @@ void Window::select_main_slot(int slot) {
     dead_ = backing.dead;
     pooled_ = backing.pooled;
     pleHist_ = backing.pleHist;
-    compact_slot_ = slot;
+    compact_state_ = physical;
     bind_session(*ss_);
+}
+
+// Both requests are idle. Move their logical ownership without copying the context.
+void Window::exchange_slots(int a, int b) {
+    activate(0);
+    const size_t set_a = (size_t) a + 1, set_b = (size_t) b + 1;
+    std::swap(sets_[set_a], sets_[set_b]);
+    std::swap(compact_backing_[(size_t) a], compact_backing_[(size_t) b]);
+    set_of_ss_[sets_[set_a]->ss] = (int) set_a;
+    set_of_ss_[sets_[set_b]->ss] = (int) set_b;
 }
 
 // Makes `set` the live state.  The live members and the stashes exchange contents (two swaps through the active set's own stash).
@@ -3905,6 +3918,9 @@ bool window_compact_batch() {
 }
 void window_select_main_slot(int slot) {
     g_the_window->select_main_slot(slot);
+}
+void window_exchange_slots(int a, int b) {
+    g_the_window->exchange_slots(a, b);
 }
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err) {
     if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }

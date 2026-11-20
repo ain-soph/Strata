@@ -202,6 +202,7 @@ int64_t prompt_chunk_for_auto();   // metal/src/engine/window.cpp: --prefill aut
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
 bool window_compact_batch();
 void window_select_main_slot(int slot);
+void window_exchange_slots(int a, int b);
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
@@ -19835,6 +19836,23 @@ int main(int argc, char** argv) {
             }
 #if defined(STRATA_GPU_METAL)
             if (compact_batch) {
+                // A cached prefix can be in the other idle slot. Exchange the backing stores so this
+                // admission can use its own prefix in place and still leave the other conversation cached.
+                if (!batch_mtp && slot_source >= 0 && slot_source != main_backing_slot &&
+                    !bs[(size_t) slot_source].active && !bs[(size_t) slot_source].partial &&
+                    !bs[(size_t) main_backing_slot].partial) {
+                    const int source = slot_source;
+                    const auto check_index = slot_ck ? slot_ck - bs[(size_t) source].checks.data() : -1;
+                    std::swap(bs[(size_t) source], bs[(size_t) main_backing_slot]);
+                    std::swap(bslot_ss[0][(size_t) source], bslot_ss[0][(size_t) main_backing_slot]);
+                    strata::metal_engine::window_exchange_slots(source, main_backing_slot);
+                    strata::metal_engine::window_select_main_slot(main_backing_slot);
+                    slot_source = main_backing_slot;
+                    if (slot_ck)
+                        slot_ck = &bs[(size_t) slot_source].checks[(size_t) check_index];
+                    std::fprintf(stderr, "strata batch: compact cache moved slot %d to %d without copying\n",
+                                 source, slot_source);
+                }
                 // The chosen backing is idle. Preserve its old prefix before any restore or model write.
                 // Keep the metadata through copy_from_slot, which may use that same prefix.
                 if (slot_source != main_backing_slot || slot_ck != nullptr)

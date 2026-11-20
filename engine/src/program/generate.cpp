@@ -195,6 +195,8 @@ void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 int64_t prompt_chunk_for_auto();   // metal/src/engine/window.cpp: --prefill auto's chunk (4 Metal prompt chunks a call)
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
+bool window_compact_batch();
+void window_select_main_slot(int slot);
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
@@ -16127,6 +16129,18 @@ int main(int argc, char** argv) {
                         (long long) sample->elapsed_ms);
             std::fflush(stdout);
         };
+#if defined(STRATA_GPU_METAL)
+        const bool compact_batch = !bs.empty() && strata::metal_engine::window_compact_batch();
+        int main_backing_slot = 0;
+        auto clear_main_prefix = [&] {
+            live_ok = false;
+            live.clear();
+            live_imgs.clear();
+            checks.clear();
+            tail_ckpt_len = -1;
+            conversations.take_reuse();
+        };
+#endif
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         // BCO <slot> <ids> (research, PAR-H; STRATA_COALESCE_PREFILL on the server): prompts of waiting requests, read in
@@ -18444,6 +18458,30 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+#if defined(STRATA_GPU_METAL)
+            if (compact_batch) {
+                int target = admit_slot;
+                if (target < 0 && !bs[(size_t) main_backing_slot].active)
+                    target = main_backing_slot;
+                if (target < 0)
+                    for (int b = 0; b < (int) bs.size(); ++b)
+                        if (!bs[(size_t) b].active) { target = b; break; }
+                if (target < 0) {
+                    std::printf("ERR compact batch: no idle slot for the request\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (target != main_backing_slot) {
+                    if (!park_current(0)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    clear_main_prefix();
+                }
+                strata::metal_engine::window_select_main_slot(target);
+                main_backing_slot = target;
+            }
+#endif
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
@@ -18984,6 +19022,15 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+#if defined(STRATA_GPU_METAL)
+            if (compact_batch) {
+                // The chosen backing is idle. Preserve its old prefix before any restore or model write.
+                // Keep the metadata through copy_from_slot, which may use that same prefix.
+                if (slot_source != main_backing_slot || slot_ck != nullptr)
+                    park_slot(main_backing_slot);
+                bs[(size_t) main_backing_slot].cached = false;
+            }
+#endif
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -22841,6 +22888,9 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
+#if defined(STRATA_GPU_METAL)
+                if (compact_batch && cont) clear_main_prefix();
+#endif
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
@@ -22850,6 +22900,10 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 admit_slot = -1;
             }
+#if defined(STRATA_GPU_METAL)
+            if (compact_batch && yielded_at >= 0 && yielded_slot == main_backing_slot)
+                clear_main_prefix();
+#endif
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];

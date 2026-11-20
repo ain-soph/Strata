@@ -331,6 +331,8 @@ public:
     // slot b's state <-> the main one (the GPU is idle between windows): the running state and the first `upto` cells of K/V
     bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
     void activate(int set);
+    bool compact_slots() const { return compact_slot_ >= 0; }
+    void select_main_slot(int slot);
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
@@ -530,6 +532,11 @@ private:
     std::vector<std::unique_ptr<SeqSet>> sets_;     // [0] the spare the main state is exchanged with, [b + 1] slot b
     std::map<const strata::core::SessionState*, int> set_of_ss_;
     int active_ = 0;
+    int compact_slot_ = -1;   // physical backing of logical set 0 in compact mode
+    int physical_set(int logical) const {
+        if (!compact_slots()) return logical;
+        return logical == 0 ? compact_slot_ : logical - 1;
+    }
     void swap_state(SeqSet& o);
     void alloc_set(SeqSet& o, bool real, int idx = 0);
     int hp_ = 0;                     // which of the two history buffers holds the committed conv history (all layers)
@@ -565,7 +572,7 @@ private:
         std::vector<int> cuts;                  // SSD streaming: the segment ends (one per layer, before its experts)
         std::vector<std::pair<int, int>> qsa;   // (dispatch, kind): 0 QsaArgs n_tok = T, 1 the merge (MAXT), 2 the scores
     };
-    std::map<int, Cached> wcache_;
+    std::map<std::pair<int, int>, Cached> wcache_;
     bool f16_enc_ = false;   // STRATA_METAL_F16: a decode window is being encoded (the MTP layer stays fp32)
     std::vector<std::pair<int, int>>* rec_ = nullptr;
     // ---- SSD streaming (stream.h): the dense weights in W_, the routed experts in the arena
@@ -864,7 +871,11 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     keyn_ = A(4 * MAXT * G_HCD); qn_ = A(4 * MAXT * G_HCD); gated_ = A(4 * MAXT * G_HCD); normW_ = A(4 * MAXT * G_HCD);
     mrope_ = A(12 * (size_t) (MAXC + 16));
     bigs_ok_ = g_slot_cap > 0;
-    const size_t NSET = 1 + (size_t) std::max(0, g_slot_cap);
+    const char* compact = std::getenv("STRATA_METAL_COMPACT_BATCH");
+    if (g_slot_cap == 2 && compact && std::string(compact) == "1") compact_slot_ = 0;
+    const size_t NSET = (size_t) std::max(0, g_slot_cap) + (compact_slots() ? 0 : 1);
+    if (compact_slots())
+        std::fprintf(stderr, "strata metal: compact batch uses %zu physical sequence states\n", NSET);
     auto R256 = [](size_t b) { return (b + 255) / 256 * 256; };
     st_gst_ = R256(GST_B); st_hist_ = R256(HIST_B); st_kq_ = R256((size_t) MAXC * G_QKV * G_QD);
     st_sc_ = R256(2 * (size_t) MAXC * G_QKV * 4); st_tail_ = R256(TAIL_B); st_dead_ = R256(DEAD_B);
@@ -1658,13 +1669,16 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
             for (int c = 0; c < G_BUD; ++c) qids_.as<int>()[t * G_BUD + c] = c;
         qdirty_ = false;
     }
-    const int key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
+    // Non-batch dispatches retain the physical buffers used when they were encoded.
+    const int state_key = compact_slots() && !rows_ ? physical_set(active_) : 0;
+    const int window_key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
                           : (((((Tn * 2 + (head ? 1 : 0)) * 2 + hp_) * (MAXT + 1)) + pend_fold_) * 2 + (sel ? 1 : 0)) * 2 +
                                 (mrope_on() ? 1 : 0);
     mrope_sync(pos0, Tn);
     const int fold_n = pend_fold_;
     pend_fold_ = 0;
     win_head_ = head;
+    const auto key = std::pair{state_key, window_key};
     auto hit = wcache_.find(key);
     if (hit != wcache_.end()) {
         // the same window shape: only the positions change (QSA's cells, the score grid)
@@ -1802,7 +1816,7 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
         const int set = rows[t] + 1;
         rows_ss_[t] = sets_[(size_t) set]->ss;
         rows_set_[t] = set;
-        ri[4 * t] = (uint32_t) set;
+        ri[4 * t] = (uint32_t) physical_set(set);
         ri[4 * t + 1] = (uint32_t) pos[t];
         ri[4 * t + 2] = (uint32_t) sets_[(size_t) set]->hp;
         ri[4 * t + 3] = mrope_on() ? (uint32_t) ((size_t) set * st_mrope_ / 4) : 0;   // its own M-RoPE table, in ints
@@ -2392,7 +2406,7 @@ bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, s
     for (size_t b = 0; b < slots.size(); ++b) {
         if ((int) b >= g_slot_cap) bigs_ok_ = false;   // more slots than the window was sized for: serial windows only
         auto x = std::make_unique<SeqSet>();
-        alloc_set(*x, true, (int) b + 1);
+        alloc_set(*x, true, physical_set((int) b + 1));
         x->ss = slots[b];
         if (slots[b] && slots[b]->qsa_states && slots[b]->qsa_alloc == (int64_t) x->kq.size() && slots[b]->qsa_ord0 == 0) {
             for (size_t j = 0; j < x->kq.size(); ++j)
@@ -2414,6 +2428,29 @@ bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, s
     std::fprintf(stderr, "strata metal: %zu batch slots, each with its own running state and K/V (%.2f GB each, %.2f GB in all)\n",
                  slots.size(), slots.empty() ? 0.0 : (double) bytes / (double) slots.size() / 1e9, (double) bytes / 1e9);
     return true;
+}
+
+void Window::select_main_slot(int slot) {
+    // A staged host read only belongs to the previous request.
+    pc_drain();
+    pc_next_ = {};
+    mtp_wait();
+    if (slot == compact_slot_) return;
+    activate(0);
+    const SeqSet& backing = *sets_[(size_t) slot + 1];
+    gst_ = backing.gst;
+    ghist_[0] = backing.gh0;
+    ghist_[1] = backing.gh1;
+    kq_ = backing.kq;
+    vq_ = backing.vq;
+    ksc_ = backing.ksc;
+    vsc_ = backing.vsc;
+    tail_ = backing.tail;
+    dead_ = backing.dead;
+    pooled_ = backing.pooled;
+    pleHist_ = backing.pleHist;
+    compact_slot_ = slot;
+    bind_session(*ss_);
 }
 
 // Makes `set` the live state.  The live members and the stashes exchange contents (two swaps through the active set's own stash).
@@ -2464,6 +2501,8 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
     }
     const size_t cells = (size_t) std::max<int64_t>(0, std::min<int64_t>(upto, max_cells_));
     auto cp = [&](const mtl::Buffer& live, const mtl::Buffer& stash, size_t n) {
+        // The main request can already be backed by the target batch slot.
+        if (live.ptr == stash.ptr) return;
         n = std::min({n, live.bytes, stash.bytes});
         if (into_slot) std::memcpy(stash.ptr, live.ptr, n); else std::memcpy(live.ptr, stash.ptr, n);
     };
@@ -3860,6 +3899,12 @@ bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, co
     const bool ok = ((Window*) w)->run_slots(rows, S, tokens, pos, out, err);
     ((Window*) w)->prof_add(true, now_ms() - t0);
     return ok;
+}
+bool window_compact_batch() {
+    return g_the_window != nullptr && g_the_window->compact_slots();
+}
+void window_select_main_slot(int slot) {
+    g_the_window->select_main_slot(slot);
 }
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err) {
     if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }

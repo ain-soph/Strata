@@ -568,6 +568,8 @@ private:
     // every layer: the distinct experts) and the GB/s each part reaches.  STRATA_METAL_STEPPROF_OUT=path: one line per group.
     void stepprof(const std::vector<mtl::Dispatch>& ds, int Tn);
     void fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp);
+    // the pending fold (pend_fold_) run now, in a graph of its own, into the live state it belongs to
+    void flush_fold();
     // the encoded window per (T, head, hp_): built once, then only the positions are patched (the host's encode cost)
     struct Cached {
         std::vector<mtl::Dispatch> ds;
@@ -1809,6 +1811,7 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
     if (S < 1 || S > MAXT || S > max_t_) { err = "metal window: batch window size out of range"; return false; }
     if (mrope_on() && mropeBig_.bytes == 0) { err = "metal window: batch rows without the slots' M-RoPE tables"; return false; }
     if (active_ != 0) activate(0);
+    flush_fold();   // the main state's own pending fold, not one encoded into (and replayed from) a batch graph
     uint32_t* ri = rinfo_.as<uint32_t>() + 8;
     int64_t maxpos = 0;
     for (int t = 0; t < S; ++t) {
@@ -2325,6 +2328,19 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
     nb_ = false;   // what follows reads the folded state: a barrier
 }
 
+// A multi-token window's commit leaves its GDN fold pending (STRATA_METAL_LAZY_FOLD) for the next window of the same
+// live state.  Whatever is about to rebind the live buffers (compact select_main_slot), copy them (slot_copy) or run
+// batch rows beside them (run_rows: its cached graphs are keyed by state 0, not by the physical set the main state is
+// in) folds it first, into the state it belongs to, as checkpoint_save does.
+void Window::flush_fold() {
+    if (pend_fold_ <= 0) return;
+    std::vector<mtl::Dispatch> ds;
+    nb_ = false;
+    fold(ds, pend_fold_, 1 - hp_);   // (hp_ already turned at the commit)
+    cx_->run_graph(ds);
+    pend_fold_ = 0;
+}
+
 void Window::swap_state(SeqSet& o) {
     auto sw = [](std::vector<mtl::Buffer>& a, std::vector<mtl::Buffer>& b) {
         for (size_t i = 0; i < a.size() && i < b.size(); ++i) std::swap(a[i], b[i]);
@@ -2447,6 +2463,7 @@ void Window::select_main_slot(int slot) {
     const int physical = physical_set(slot + 1);
     if (physical == compact_state_) return;
     activate(0);
+    flush_fold();   // the last window's fold belongs to the physical set the main state leaves
     const SeqSet& backing = *sets_[(size_t) slot + 1];
     gst_ = backing.gst;
     ghist_[0] = backing.gh0;
@@ -2506,7 +2523,8 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
     if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
     activate(0);
     SeqSet& o = *sets_[(size_t) b + 1];
-    if (pend_fold_ > 0 || o.pend_fold > 0) { err = "metal window: a slot copy with a fold pending"; return false; }
+    flush_fold();   // the main state's (a request ended on a multi-token window and was not parked): fold it, do not refuse
+    if (o.pend_fold > 0) { err = "metal window: a slot copy with a fold pending"; return false; }
     if (into_slot && mrope_on() && o.mrope.bytes > 0) {
         // the slot's positions from the request's table: its cells [0, upto) as they are (the K/V rows hold them rotated
         // already), then the text after them, one position a cell on from the last one (a prompt never ends in an image,

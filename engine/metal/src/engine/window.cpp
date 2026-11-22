@@ -500,7 +500,7 @@ private:
     std::vector<mtl::Buffer> gstBig_, hbBig_, kqBig_, vqBig_, kscBig_, vscBig_, tailBig_, deadBig_, pooledBig_;
     mtl::Buffer pleBig_, rinfo_;
     size_t st_gst_ = 0, st_hist_ = 0, st_kq_ = 0, st_sc_ = 0, st_tail_ = 0, st_dead_ = 0, st_pooled_ = 0, st_ple_ = 0;   // bytes between sets
-    // --vision: the slots' own M-RoPE tables side by side (set idx at idx * st_mrope_), so a batch row rotates by its own
+    // --vision: the slots' own M-RoPE tables side by side (physical set idx at idx * st_mrope_), so a batch row rotates by its own
     // slot's table (rinfo_ row word 3: its offset in ints); allocated with the slots, only when the table is set
     mtl::Buffer mropeBig_;
     size_t st_mrope_ = 0;
@@ -1818,10 +1818,17 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
         const int set = rows[t] + 1;
         rows_ss_[t] = sets_[(size_t) set]->ss;
         rows_set_[t] = set;
-        ri[4 * t] = (uint32_t) physical_set(set);
+        // compact mode: logical set `set` lives in physical set phys (exchange_slots moves it); the slot's state AND its
+        // M-RoPE table (the view alloc_set made at the physical index, moved along by exchange_slots) are found there
+        const int phys = physical_set(set);
+        if (mrope_on() && sets_[(size_t) set]->mrope.ptr != (char*) mropeBig_.ptr + (size_t) phys * st_mrope_) {
+            err = "metal window: a batch slot's M-RoPE table is not at its physical set";
+            return false;
+        }
+        ri[4 * t] = (uint32_t) phys;
         ri[4 * t + 1] = (uint32_t) pos[t];
         ri[4 * t + 2] = (uint32_t) sets_[(size_t) set]->hp;
-        ri[4 * t + 3] = mrope_on() ? (uint32_t) ((size_t) set * st_mrope_ / 4) : 0;   // its own M-RoPE table, in ints
+        ri[4 * t + 3] = mrope_on() ? (uint32_t) ((size_t) phys * st_mrope_ / 4) : 0;   // its own M-RoPE table, in ints
         maxpos = std::max<int64_t>(maxpos, pos[t]);
     }
     rows_ = true;

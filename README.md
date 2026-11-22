@@ -1,12 +1,14 @@
-> **ain-soph fork (`serving` branch, on upstream v0.2.13).** Changes for a long-running Mac server (M5 Ultra, 96 GB):
-> - **Metal `--prefill auto` overlaps the prompt's host rows with the GPU.** Upstream, auto takes the CUDA fallback for
->   "no expert-cache slot to lend" (1024 tokens a call), but the Metal prompt path never borrows slots: every call was a
->   single Metal chunk, so the next chunk's embedding + PLE rows (the hostpipe) were computed on the CPU while the GPU
->   waited (~76% busy). Auto on Metal now hands each call 4 chunks of 1024 rows (`STRATA_METAL_PROMPT_CHUNK` still sets
->   the chunk), keeping the same buffers. Qwen3.8-Flash-Next AD-4.27, resident, `--batch 2`, MTP: prefill 1,854 -> 2,014
->   tok/s at 26K tokens (+9-18% across runs) and 1,999 -> 2,225 at 116K (+11%); peak memory, decode (117 / 74 tok/s at
->   1 / 2 streams) and the temp-0 output are unchanged. Before this, the same speed needed
->   `--prefill 4096` + `STRATA_METAL_PROMPT_CHUNK=1024`. Code: `prompt_chunk_for_auto` (metal/src/engine/window.cpp).
+> **ain-soph fork (`serving` branch, based on upstream `main` 6e38f58, after v0.2.18).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Metal `--prefill auto` hands each call 4 chunks of 1024 rows | auto made 1024-token calls, so the CPU hostpipe never overlapped the GPU | `--prefill auto` (`STRATA_METAL_PROMPT_CHUNK` still sets the chunk) | prefill 26K 1,854 → 2,014 tok/s, 116K 1,999 → 2,225; decode, memory, temp-0 output unchanged |
+> | M5 Ultra prefill kernels and cross-chunk host row prefetch | Keep the prompt matrix units fed and skip drafter work outside checkpoint bounds | On with the Metal prompt path | AD-4.27 variants, 26K prefill 2.28K → 2.75K tok/s. 260K needle matched |
+> | Metal fast load and parallel vision startup | Skip unused host allocations and overlap encoder startup | `STRATA_METAL_FAST_LOAD=0` or `STRATA_PARALLEL_VISION=0` disables the respective change | AtomicChat ready 8.44 → 4.46 s, peak wired 71,024 → 70,963 MiB |
+> | Metal decode fusion and optional IQ3_S gate/up and Wsg dot kernels | Reduce dispatches and test faster math while preserving release prompt parity | Fused router and GR on. `STRATA_METAL_IQ_DEC_OPT=3` and `STRATA_METAL_W_DOT=1` opt in to the precision-changing paths | Both AD-4.27 variants matched all four short responses with the two options off |
+> | Metal compact batching | Reuse an idle slot for prompt reads and conversation restore | `STRATA_METAL_COMPACT_BATCH=1` with `--batch 2` | AD-4.27, 262K: peak wired 70,962 → 67,061 MiB; identical sampled responses |
+>
+> Full numbers: [Qwen3.8 Flash-Next in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#文本qwen38-flash-nextstrata). Upstream PRs: issue [#6182](https://github.com/Niko1221/Strata/issues/6182) + draft PR [#6183](https://github.com/Niko1221/Strata/pull/6183). The closed-stdin EngineDied fix is upstream (#6055) and no longer carried here.
 
 <p align="center">
   <picture>

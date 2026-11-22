@@ -1676,7 +1676,8 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     // Non-batch dispatches retain the physical buffers used when they were encoded.
     const int state_key = compact_slots() && !rows_ ? physical_set(active_) : 0;
-    const int window_key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
+    // (batch rows: run_rows folded the main state's pend first, so a batch graph never carries a fold)
+    const int window_key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0)
                           : (((((Tn * 2 + (head ? 1 : 0)) * 2 + hp_) * (MAXT + 1)) + pend_fold_) * 2 + (sel ? 1 : 0)) * 2 +
                                 (mrope_on() ? 1 : 0);
     mrope_sync(pos0, Tn);
@@ -2332,7 +2333,8 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
 // A multi-token window's commit leaves its GDN fold pending (STRATA_METAL_LAZY_FOLD) for the next window of the same
 // live state.  Whatever is about to rebind the live buffers (compact select_main_slot), copy them (slot_copy) or run
 // batch rows beside them (run_rows: its cached graphs are keyed by state 0, not by the physical set the main state is
-// in) folds it first, into the state it belongs to, as checkpoint_save does.
+// in), run other sets' windows over the shared projection buffers it reads (run_slots), snapshot it (checkpoint_save) or
+// prefill on it (prompt_chunk) folds it first, into the state it belongs to.
 void Window::flush_fold() {
     if (pend_fold_ <= 0) return;
     std::vector<mtl::Dispatch> ds;
@@ -2503,10 +2505,11 @@ bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int6
     pc_drain();
     if (sets_.empty()) { err = "metal window: no batch slots"; return false; }
     static const bool one_window = !(std::getenv("STRATA_METAL_BATCH_ROWS") && std::string(std::getenv("STRATA_METAL_BATCH_ROWS")) == "0");
-    if (one_window && bigs_ok_) {
-        activate(0);
-        return run_rows(rows, S, tokens, pos, out, err);
-    }
+    // the main state's pending fold first, while its window's projections are still in the shared qkvL_/alL_/beL_/zL_: the
+    // per-slot windows below rewrite them, and activate() would carry the pend in the stash to the main state's next window
+    activate(0);
+    flush_fold();
+    if (one_window && bigs_ok_) return run_rows(rows, S, tokens, pos, out, err);
     bool ok = true;
     for (int t = 0; t < S && ok; ++t) {
         if (rows[t] < 0 || rows[t] >= n_slots()) { err = "metal window: a batch row names a slot that does not exist"; ok = false; break; }
@@ -2589,13 +2592,7 @@ void Window::bind_draft(strata::core::QsaState& st) {
 
 bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err) {
     (void) err;
-    if (pend_fold_ > 0) {   // the last commit's fold first: the checkpoint is the state after it
-        std::vector<mtl::Dispatch> ds;
-        nb_ = false;
-        fold(ds, pend_fold_, 1 - hp_);
-        cx_->run_graph(ds);
-        pend_fold_ = 0;
-    }
+    flush_fold();   // the last commit's fold first: the checkpoint is the state after it
     // The checkpoint is the shared contract (core/conversation_state.cpp's conversation_state_sizes), the one the CUDA indexer
     // keeps: the raw tail is idx_block - 1 = 3 rows a layer and block_pos is a scratch int32 a layer.  This window's ring has
     // 4 rows (slot = cell % 4), but row 3 is written by the cell that completes the block before it is read, so it never
@@ -3379,13 +3376,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     if (Tn < 1 || Tn > p.MT) { err = "metal prompt: chunk size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal prompt: the chunk runs past the context"; return false; }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
-    if (pend_fold_ > 0) {   // the last decode window's commit, still pending
-        std::vector<mtl::Dispatch> fd;
-        nb_ = false;
-        fold(fd, pend_fold_, 1 - hp_);
-        cx_->run_graph(fd);
-        pend_fold_ = 0;
-    }
+    flush_fold();   // the last decode window's commit, still pending
     const int T = Tn;
     // ---- the embeddings into every stream, the PLE rows
     {

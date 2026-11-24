@@ -189,7 +189,7 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
                 raw[a.plane] = yv * q2s[jj & 7];
                 raw[2 * a.plane] = yv * p4s[jj & 3];
                 raw[3 * a.plane] = (jj & 1) ? yv * 0.00390625f : yv;
-                if (xh16) put_x16(y, a.plane, t * hv * S + h * S + j, jj, yv);
+                if (xh16) put_x16(y, a.plane, tr * hv * S + h * S + j, jj, yv);   // (tr: the row in the window; row0 = 0 outside batch rows)
                 ys[j] = yv;
             }
         }

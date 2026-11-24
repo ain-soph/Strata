@@ -125,6 +125,13 @@ bool batch_mtp_env() {
     return !(ch && std::string(ch) == "0") && !(br && std::string(br) == "0");
 }
 
+// QSA indexer tail (ain-soph serving): a rejected window row must not leave its raw indexer key in tail[cell % 4] over a kept cell's
+// (qsa.metal QSA_UNDO); the commits put the replaced keys back.  STRATA_METAL_QSA_UNDO=0: the old behaviour.
+static bool qsa_undo_env() {
+    const char* e = std::getenv("STRATA_METAL_QSA_UNDO");
+    return !(e && std::string(e) == "0");
+}
+
 namespace {
 
 int g_slot_cap = 0;   // --batch N: the window keeps N + 1 sequences' running states side by side (set_batch_slots)
@@ -408,6 +415,9 @@ public:
     // drafts[k * 8 + j], probs[k * 8 + j], n[k] for the k-th queued round: as the solo drafter, up to and including the first
     // draft whose probability is < min_p
     bool batch_drafts_run(int32_t* drafts, float* probs, int* n, float min_p, std::string& err);
+    // slot b ended in the last batch window: the draft layer's K/V of its n kept cells p .. p + n - 1 (rows row0 .., tokens[i] the pick
+    // after row row0 + i), queued with the rounds - the cells a draft round would have written (a later turn reads them)
+    bool batch_draft_kv(int b, int row0, const int32_t* tokens, int64_t p, int n, std::string& err);
     bool batch_mtp_on() const { return bmtp_ && mtp_on_ && chain_; }
     // slot b's state <-> the main one (the GPU is idle between windows): the running state and the first `upto` cells of K/V
     bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
@@ -494,7 +504,7 @@ private:
     // embedding rows go to memb_ rows erow..; tokens == nullptr: memb_ row erow already holds the embedding (put
     // there by mtp_embed on the GPU).  `slot`: the dense attention's cell list (one per draft step of a round).
     void mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR, size_t src_off, int n, const int32_t* tokens,
-                    int64_t cell0, bool full, int erow = 0, int slot = 0);
+                    int64_t cell0, bool full, int erow = 0, int slot = 0, int nf = 1);
     // a draft round's step j on the GPU: the pick and its probability (dout_/dprob_ [j]), and with `embed` the picked
     // token's embedding into memb_ row 0 (the next step's input)
     void mtp_pick(std::vector<mtl::Dispatch>& ds, int j, bool embed, int jb = 0);
@@ -598,6 +608,11 @@ private:
     std::vector<mtl::Dispatch> post_ds_;      // queued: the commits' GDN folds and the slots' draft rounds
     struct PostRound { int jb; int steps; };
     std::vector<PostRound> post_rounds_;
+    int post_blocks_ = 0;   // memb_ blocks of 4 rows taken by the queued rounds and K/V catch-ups (the host writes them at encoding)
+    // STRATA_METAL_BMTP_PROF=1 (diagnostic): batch_drafts_run times the queue's parts (fold / each round's catch-up / step) on
+    // alternate windows as separate command buffers; post_cuts_ = (kind, first dispatch)
+    std::vector<std::pair<int, size_t>> post_cuts_;
+    std::vector<mtl::Dispatch> proto1_, proto2_;   // BMTP_PROF item-1 prototype: slot 0's step alone, and as a merged 2-row step
     void flush_post();                        // runs post_ds_ (its draft rounds' results are dropped)
     // the draft layer's K/V per physical compact set (mkq_[0] .. are views of the main sequence's set)
     mtl::Buffer mkqBig_, mvqBig_, mkscBig_, mvscBig_;
@@ -719,6 +734,11 @@ private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
     bool ple_on_ = false;
     int last_T_ = 0;
+    int64_t last_pos0_ = 0;   // the last solo window's first cell (Window::commit: the rejected rows' cells)
+    // QSA tail undo (qsa.metal QSA_UNDO): per QSA layer MAXT rows of ID floats, the tail values the window's rows replaced
+    bool qsa_undo_ = false;
+    mtl::Buffer undo_;
+    void undo_tail(const mtl::Buffer& tail, int qi, int t, int64_t cell);
     int head_rows_ = 0;              // rows of lm_ the last window's head wrote (logits_row)
     double last_gpu_ms_ = 0;
     int last_n_disp_ = 0;
@@ -999,6 +1019,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, PLEH_B); } else pleHist_ = A(PLEH_B);
     rinfo_ = A(4 * (8 + 4 * MAXT));
+    qsa_undo_ = qsa_undo_env();
+    undo_ = A((size_t) 4 * G_NL / G_QI * MAXT * G_ID + 256);
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -1434,8 +1456,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const mtl::Buffer& PL = rw ? pooledBig_[(size_t) qi] : pooled_[(size_t) qi];
         // (pictures in batch slots: each row reads its own slot's M-RoPE table in mropeBig_)
         const mtl::Constants rcm = mrope_on() ? mtl::Constants().b(30, true).b(24, true) : rc;
-        d.p = rw ? P(lqsa_, "qsa_prep", rcm, mrope_on() ? "qsa_prep#rows#mrope" : "qsa_prep#rows")
-                 : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
+        // (QSA_UNDO, fc 35: the replaced tail values of each row go to undo_, for the commit of a window with rejected rows)
+        mtl::Constants uc = rw ? rcm : qsa_c();
+        if (qsa_undo_) uc = uc.b(35, true);
+        const std::string uk = (rw ? std::string(mrope_on() ? "qsa_prep#rows#mrope" : "qsa_prep#rows") : qsa_k()) + (qsa_undo_ ? "#u" : "");
+        d.p = P(lqsa_, "qsa_prep", uc, uk);
         d.args = {mtl::Arg::B(qfull_), mtl::Arg::B(kcur_), mtl::Arg::B(vcur_), mtl::Arg::B(iqr_), mtl::Arg::B(ikr_),
                   mtl::Arg::B(W_, T(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(b + "attn_k_norm.weight").offset),
                   mtl::Arg::B(W_, T(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
@@ -1443,7 +1468,8 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
                   mtl::Arg::B(VQ), mtl::Arg::B(KS), mtl::Arg::B(VS),
                   mtl::Arg::B(TL), mtl::Arg::B(DD), mtl::Arg::B(PL),
                   mtl::Arg::V(a), mtl::Arg::B(rw && mrope_on() ? mropeBig_ : mrope_)};
-        if (rw) d.args.push_back(mtl::Arg::B(rinfo_));
+        if (rw || qsa_undo_) d.args.push_back(mtl::Arg::B(rinfo_));   // (buffer 21; unused without rows)
+        if (qsa_undo_) d.args.push_back(mtl::Arg::B(undo_, (size_t) qi * MAXT * G_ID * 4));
         d.grid[0] = G_QPREP;
         d.grid[1] = ntok;
         d.tg[0] = 256;
@@ -1984,7 +2010,6 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
     win_gpu_[Tn] += last_gpu_ms_;
     for (int t = 0; t < Tn; ++t) out[t] = tokout_.as<int32_t>()[t];
     head_rows_ = Tn;   // the batch window's head wrote Tn logits rows (the #879 scan reads them)
-    if (dump_rt_) dump_routing_rows(rids_all_.as<int32_t>(), rwts_all_.as<float>(), Tn, G_NL, MAXT, TOPK);   // each row one slot's token (concurrent MTP: draft rows too)
     pend_segs_.clear();
     for (int t = 0; t < Tn; ++t) rows_tok_[t] = tokens[t];
     for (int t = 0; t < Tn; ++t) {
@@ -2004,6 +2029,8 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
         s.ss->ple_prev[0] = s.ss->ple_prev[1];
         s.ss->ple_prev[1] = tokens[t];
     }
+    // each row one slot's token; with draft rows (segments) the kept rows are known at commit_rows, which writes them
+    if (dump_rt_ && pend_segs_.empty()) dump_routing_rows(rids_all_.as<int32_t>(), rwts_all_.as<float>(), Tn, G_NL, MAXT, TOPK);
     return true;
 }
 
@@ -2425,6 +2452,7 @@ bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int3
     last_head_ = head;
     for (int t = 0; t < Tn; ++t) out[t] = head ? tokout_.as<int32_t>()[t] : -1;
     last_T_ = Tn;
+    last_pos0_ = pos0;
     head_rows_ = head ? Tn : 0;
     for (int t = 0; t < Tn; ++t) last_tokens_[t] = tokens[t];
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
@@ -2862,6 +2890,9 @@ void Window::draft_bind_phys(int phys) {
 }
 
 void Window::flush_post() {
+    post_cuts_.clear();
+    post_blocks_ = 0;
+    proto1_.clear(); proto2_.clear();
     if (post_ds_.empty()) { post_rounds_.clear(); return; }
     cx_->run_graph(post_ds_);
     post_ds_.clear();
@@ -2875,12 +2906,32 @@ void Window::flush_post() {
 bool Window::commit_rows(const int* keep, std::string& err) {
     if (pend_segs_.empty()) return true;
     using namespace strata::kernels;
+    if (dump_rt_) {   // the window's kept rows in row order (a segment's accepted prefix; one-row segments whole), as runs of rows
+        bool kept[MAXT];
+        for (int t = 0; t < rows_n_; ++t) kept[t] = true;
+        for (const PendSeg& sg : pend_segs_)
+            for (int t = sg.first + std::max(1, std::min(keep[sg.set - 1], sg.n)); t < sg.first + sg.n; ++t) kept[t] = false;
+        for (int t = 0; t < rows_n_;) {
+            if (!kept[t]) { ++t; continue; }
+            int e = t;
+            while (e < rows_n_ && kept[e]) ++e;
+            dump_routing_rows(rids_all_.as<int32_t>() + (size_t) t * TOPK, rwts_all_.as<float>() + (size_t) t * TOPK, e - t, G_NL, MAXT, TOPK);
+            t = e;
+        }
+    }
     bool first_d = post_ds_.empty();
+    post_cuts_.push_back({0, post_ds_.size()});
     for (const PendSeg& sg : pend_segs_) {
         const int b = sg.set - 1, m = keep[b];
         if (m < 1 || m > sg.n) { err = "metal window: a slot's kept rows are outside its segment"; pend_segs_.clear(); return false; }
         SeqSet& st = *sets_[(size_t) sg.set];
         const int phys = physical_set(sg.set), hp = st.hp;
+        if (qsa_undo_ && m < sg.n) {   // the segment's rejected rows: their indexer keys out of the slot's tail ring, last row first
+            const uint32_t* ri = rinfo_.as<uint32_t>() + 8;
+            for (int t = sg.first + sg.n - 1; t >= sg.first + m; --t)
+                for (int qi = 0; qi < (int) tailBig_.size(); ++qi)
+                    undo_tail(view_of(tailBig_[(size_t) qi], (size_t) ri[4 * t] * st_tail_, TAIL_B), qi, t, (int64_t) ri[4 * t + 1]);
+        }
         for (int l = 0; l < G_NL; ++l) {
             if (l % G_QI == G_QI - 1) continue;
             const int gi = l - l / G_QI;
@@ -2928,7 +2979,7 @@ bool Window::commit_rows(const int* keep, std::string& err) {
 bool Window::batch_draft_add(int b, int row0, const int32_t* tokens, int64_t p, int a, int max_steps, std::string& err) {
     if (!batch_mtp_on()) { err = "metal window: concurrent MTP is off"; return false; }
     const int k = (int) post_rounds_.size();
-    if (k >= 2) { err = "metal window: more than two draft rounds queued"; return false; }
+    if (k >= 2 || post_blocks_ >= 2) { err = "metal window: more than two draft rounds queued"; return false; }
     static const int cap = [] {
         const char* e = std::getenv("STRATA_METAL_BATCH_MTP_DRAFTS");
         return e ? std::max(1, std::min(3, std::atoi(e))) : 1;   // (A/B 2026-11-23: 1 draft a slot beats 2 at c=2 on the M5 Ultra)
@@ -2936,7 +2987,7 @@ bool Window::batch_draft_add(int b, int row0, const int32_t* tokens, int64_t p, 
     max_steps = std::max(1, std::min({max_steps, cap, 3}));
     if (a < 0 || a > 3 || row0 < 0 || row0 + a >= MAXT) { err = "metal window: draft round arguments out of range"; return false; }
     while (max_steps > 1 && p + a + max_steps + 1 >= max_cells_) --max_steps;
-    const int jb = 4 * k, eb = 4 * k;
+    const int jb = 4 * k, eb = 4 * post_blocks_;
     // the slot's draft K/V and M-RoPE table for the encoding (the buffers are bound now; the live members are restored after)
     mtp_wait();
     mdphys_ = -1;
@@ -2952,10 +3003,22 @@ bool Window::batch_draft_add(int b, int row0, const int32_t* tokens, int64_t p, 
     nb_ = false;
     std::vector<mtl::Dispatch>& ds = post_ds_;
     const int32_t tok = tokens[a];
+    post_cuts_.push_back({1 + 2 * k, ds.size()});
     if (a > 0) mtp_encode(ds, R_, (size_t) row0 * HC * N * 4, a, tokens, p, false, eb);
     nb_ = false;
+    post_cuts_.push_back({2 + 2 * k, ds.size()});
     mtp_encode(ds, R_, (size_t) (row0 + a) * HC * N * 4, 1, &tok, p + a, true, eb + a, jb);
     mtp_pick(ds, 0, max_steps > 1, jb);
+    static const bool prof_proto = std::getenv("STRATA_METAL_BMTP_PROF") && std::string(std::getenv("STRATA_METAL_BMTP_PROF")) == "1";
+    if (prof_proto && k == 0 && max_steps == 1) {   // (timed apart, after the queue; writes this slot's draft K/V cells p + a, p + a + 1,
+        const int32_t tok2[2] = {tok, tok};         //  which the next window rewrites before any draft reads them)
+        proto1_.clear(); proto2_.clear();
+        nb_ = false;
+        mtp_encode(proto1_, R_, (size_t) (row0 + a) * HC * N * 4, 1, &tok, p + a, true, eb + a, jb);
+        nb_ = false;
+        mtp_encode(proto2_, R_, (size_t) (row0 + a) * HC * N * 4, 2, tok2, p + a, true, eb + a, jb, 2);
+        nb_ = false;
+    }
     for (int j = 1; j < max_steps; ++j) {
         mtp_encode(ds, mR_, 0, 1, nullptr, p + a + j, true, 0, jb + j);
         mtp_pick(ds, j, j + 1 < max_steps, jb);
@@ -2964,6 +3027,29 @@ bool Window::batch_draft_add(int b, int row0, const int32_t* tokens, int64_t p, 
     mdphys_ = -1;
     mdmrope_ = false;
     post_rounds_.push_back({jb, max_steps});
+    ++post_blocks_;
+    return true;
+}
+
+bool Window::batch_draft_kv(int b, int row0, const int32_t* tokens, int64_t p, int n, std::string& err) {
+    static const bool on = !(std::getenv("STRATA_METAL_BATCH_MTP_BDONE") && std::string(std::getenv("STRATA_METAL_BATCH_MTP_BDONE")) == "0");
+    if (!on || n < 1) return true;
+    if (!batch_mtp_on()) { err = "metal window: concurrent MTP is off"; return false; }
+    if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
+    if (p + n > max_cells_) return true;   // (nothing to write past the cache; the request ended there)
+    if (n > 4 || row0 < 0 || row0 + n > MAXT) { err = "metal window: draft K/V catch-up out of range"; return false; }
+    if (post_blocks_ >= 2) { err = "metal window: more than two draft rounds queued"; return false; }
+    mtp_wait();
+    const int set = b + 1;
+    mdphys_ = physical_set(set);
+    mdmrope_ = mrope_on() && mropeBig_.bytes > 0;
+    nb_ = false;
+    post_cuts_.push_back({6, post_ds_.size()});   // (even: not a round's catch-up)
+    mtp_encode(post_ds_, R_, (size_t) row0 * HC * N * 4, n, tokens, p, false, 4 * post_blocks_);
+    nb_ = false;
+    mdphys_ = -1;
+    mdmrope_ = false;
+    ++post_blocks_;
     return true;
 }
 
@@ -2971,7 +3057,66 @@ bool Window::batch_drafts_run(int32_t* drafts, float* probs, int* n, float min_p
     (void) err;
     const std::vector<PostRound> rounds = post_rounds_;
     const double t0 = now_ms();
-    if (!post_ds_.empty()) cx_->run_graph(post_ds_);
+    static const bool prof = std::getenv("STRATA_METAL_BMTP_PROF") && std::string(std::getenv("STRATA_METAL_BMTP_PROF")) == "1";
+    if (prof && !post_ds_.empty()) {
+        // [0] whole: n, gpu, wall; [1..] split windows: per kind gpu sum and count (kind 0 fold, 1 + 2k catch-up k, 2 + 2k step k)
+        static long long nw = 0, nwhole = 0, nsplit = 0, kn[10] = {};
+        static double whole_gpu = 0, whole_wall = 0, split_wall = 0, kg[10] = {};
+        static std::map<int, std::pair<long long, double>> by_rounds;   // whole windows by (rounds * 10 + catch-up rows present)
+        ++nw;
+        if (nw % 2 == 0) {
+            const double w0 = now_ms();
+            const double g = 1000.0 * cx_->run_graph(post_ds_);
+            whole_wall += now_ms() - w0; whole_gpu += g; ++nwhole;
+            int ncu = 0;
+            for (size_t i = 0; i < post_cuts_.size(); ++i)
+                if (post_cuts_[i].first % 2 == 1) {
+                    const size_t e = i + 1 < post_cuts_.size() ? post_cuts_[i + 1].second : post_ds_.size();
+                    if (e > post_cuts_[i].second) ++ncu;
+                }
+            auto& br = by_rounds[(int) rounds.size() * 10 + ncu];
+            ++br.first; br.second += g;
+        } else {
+            const double w0 = now_ms();
+            for (size_t i = 0; i < post_cuts_.size(); ++i) {
+                const size_t b = post_cuts_[i].second, e = i + 1 < post_cuts_.size() ? post_cuts_[i + 1].second : post_ds_.size();
+                if (e <= b) continue;
+                std::vector<mtl::Dispatch> part(post_ds_.begin() + (long) b, post_ds_.begin() + (long) e);
+                const int kd = std::min(7, post_cuts_[i].first);
+                kg[kd] += 1000.0 * cx_->run_graph(part); ++kn[kd];
+            }
+            split_wall += now_ms() - w0; ++nsplit;
+            if (rounds.size() == 2 && !proto1_.empty() && !proto2_.empty()) {   // k8: one slot's step again; k9: a merged 2-row step
+                kg[8] += 1000.0 * cx_->run_graph(proto1_); ++kn[8];
+                kg[9] += 1000.0 * cx_->run_graph(proto2_); ++kn[9];
+            }
+        }
+        if (nw % 400 == 0) {
+            std::fprintf(stderr, "strata metal: BMTP_PROF %lld windows: whole gpu %.3f wall %.3f ms (%lld); split wall %.3f ms (%lld):",
+                         nw, whole_gpu / std::max(1LL, nwhole), whole_wall / std::max(1LL, nwhole), nwhole,
+                         split_wall / std::max(1LL, nsplit), nsplit);
+            for (int kd = 0; kd < 10; ++kd)
+                if (kn[kd]) std::fprintf(stderr, " k%d %.3f ms x%lld", kd, kg[kd] / kn[kd], kn[kd]);
+            for (const auto& kv : by_rounds) std::fprintf(stderr, " | r%d cu%d %.3f ms x%lld", kv.first / 10, kv.first % 10, kv.second.second / kv.second.first, kv.second.first);
+            std::fprintf(stderr, "\n");
+        }
+    } else if (!post_ds_.empty()) {
+        // STRATA_METAL_BMTP_FOLD_ASYNC=1 (experiment): the commits' GDN folds on the second queue beside the draft rounds (the two touch
+        // different buffers: the folds the GDN states, conv histories and the window's GDN inputs; the rounds the draft layer's)
+        static const bool fasync = std::getenv("STRATA_METAL_BMTP_FOLD_ASYNC") && std::string(std::getenv("STRATA_METAL_BMTP_FOLD_ASYNC")) == "1";
+        const size_t fe = post_cuts_.size() > 1 && post_cuts_[0].first == 0 && post_cuts_[0].second == 0 ? post_cuts_[1].second : 0;
+        if (fasync && fe > 0 && fe < post_ds_.size()) {
+            const std::vector<mtl::Dispatch> fold_ds(post_ds_.begin(), post_ds_.begin() + (long) fe);
+            const std::vector<mtl::Dispatch> rest(post_ds_.begin() + (long) fe, post_ds_.end());
+            void* tok = cx_->run_graph_async(fold_ds);
+            cx_->run_graph(rest);
+            cx_->wait_async(tok);
+        } else
+            cx_->run_graph(post_ds_);
+    }
+    post_cuts_.clear();
+    post_blocks_ = 0;
+    proto1_.clear(); proto2_.clear();
     post_ds_.clear();
     post_rounds_.clear();
     for (size_t k = 0; k < rounds.size(); ++k) {
@@ -2987,6 +3132,10 @@ bool Window::batch_drafts_run(int32_t* drafts, float* probs, int* n, float min_p
     }
     prof_add(true, now_ms() - t0);
     return true;
+}
+
+void Window::undo_tail(const mtl::Buffer& tail, int qi, int t, int64_t cell) {
+    std::memcpy((float*) tail.ptr + (size_t) (cell & 3) * G_ID, undo_.as<float>() + ((size_t) qi * MAXT + t) * G_ID, (size_t) G_ID * 4);
 }
 
 bool Window::commit(int n_keep, std::string& err) {
@@ -3010,6 +3159,9 @@ bool Window::commit(int n_keep, std::string& err) {
             hp_ = 1 - hp_;
         }
     }
+    if (qsa_undo_)   // the rejected rows' indexer keys out of the tail ring, last row first (the GPU is idle: the window has ended)
+        for (int t = last_T_ - 1; t >= n_keep; --t)
+            for (int qi = 0; qi < (int) tail_.size(); ++qi) undo_tail(tail_[(size_t) qi], qi, t, last_pos0_ + t);
     if (dump_rt_) dump_routing_rows(rids_all_.as<int32_t>(), rwts_all_.as<float>(), n_keep, G_NL, MAXT, TOPK);   // the kept rows
     strata::core::SessionState& ss = *ss_;
     for (int t = 0; t < n_keep; ++t) {
@@ -3089,7 +3241,7 @@ bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err)
     const int MAXC = (int) max_cells_, MB = MAXC / 4 + 2;
     mR_ = A(4 * MAXT * HC * N); memb_ = A(4 * MAXT * N); men_ = A(4 * MAXT * N); me2_ = A(4 * MAXT * N);
     mhn_ = A(4 * MAXT * HC * N); mh2_ = A(4 * HC * MAXT * N); midx_ = A(4 * MAXT * (G_IQR + G_ID)); mbo_ = A(4 * MAXT * N);
-    minj_[0] = A(4 * MAXT * HC); minj_[1] = A(4 * MAXT * HC); mqids_ = A(4 * MAXT * G_BUD); mlm_ = A(4 * (size_t) n_vocab_);
+    minj_[0] = A(4 * MAXT * HC); minj_[1] = A(4 * MAXT * HC); mqids_ = A(4 * MAXT * G_BUD); mlm_ = A(4 * 2 * (size_t) n_vocab_);   // (2 rows: the BMTP_PROF timing prototype)
     auto act = [&](int n) {
         Act x;
         x.n = n;
@@ -3219,7 +3371,9 @@ void Window::gr_read_m(std::vector<mtl::Dispatch>& ds, const std::string& pre, m
 }
 
 void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR, size_t src_off, int n, const int32_t* tokens,
-                        int64_t cell0, bool full, int erow, int slot) {
+                        int64_t cell0, bool full, int erow, int slot, int nf) {
+    // nf (BMTP_PROF item-1 timing prototype only): the full part on nf rows (rows 0..nf-1 of the front, each attending to its
+    // own cell cell0 + t of the same set) - the cost of one merged step for nf slots; production calls use nf = 1
     struct RmsArgs { uint32_t n; float eps; };
     struct XpArgs { uint32_t n, n_tok, plane_tok, stride; };
     struct CombArgs { uint32_t n, hc, n_tok, h_stride; };
@@ -3319,33 +3473,35 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
     if (!full) return;
     // ---- dense attention over the window of cells up to this one (the draft layer's rule), the output gate, o_proj
     {
-        int* ids = mqids_.as<int>() + (size_t) slot * G_BUD;
-        const int64_t first = std::max<int64_t>(0, cell0 - 2050);
-        for (int64_t c = first; c <= cell0; ++c) ids[c - first] = (int) c;
+        for (int t = 0; t < nf; ++t) {
+            int* ids = mqids_.as<int>() + (size_t) (slot + t) * G_BUD;
+            const int64_t first = std::max<int64_t>(0, cell0 + t - 2050);
+            for (int64_t c = first; c <= cell0 + t; ++c) ids[c - first] = (int) c;
+        }
         mtl::Dispatch at;
         at.p = P(lqsa_, "qsa_attn", {}, "qsa_attn");
         at.args = {mtl::Arg::B(qcur_), dkv(0), dkv(1), dkv(2), dkv(3),
                    mtl::Arg::B(mqids_, (size_t) slot * G_BUD * 4), mtl::Arg::B(part_), mtl::Arg::V(qa)};
-        at.grid[0] = G_QCHUNKS; at.grid[1] = G_QKV; at.grid[2] = 1; at.tg[0] = 256;
+        at.grid[0] = G_QCHUNKS; at.grid[1] = G_QKV; at.grid[2] = nf; at.tg[0] = 256;
         push(ds, at);
         mtl::Dispatch m;
         m.p = P(lqsa_, "qsa_merge", {}, "qsa_merge");
         QsaArgs am = qa;
         am.n_tok = MAXT;
         m.args = {mtl::Arg::B(part_), mtl::Arg::B(qfull_), mtl::Arg::B(XQ_.b), mtl::Arg::V(am)};
-        m.grid[0] = G_QH; m.grid[1] = 1; m.tg[0] = 256;
+        m.grid[0] = G_QH; m.grid[1] = nf; m.tg[0] = 256;
         push(ds, m);
-        gm(L + "self_attn.o_proj.weight", XQ_, mbo_, N, 1);
+        gm(L + "self_attn.o_proj.weight", XQ_, mbo_, N, nf);
     }
     // ---- the MLP hyper-connection (the attention write folded in), the MoE, the write + final mixer, the head
-    gr_read_m(ds, L + "mlp_hyper_connection", mR_, mbo_, minj_[0], minj_[1], true, XF_, false, 1);
-    gm(L + "mlp.gate.weight", XF_, logits_, 512, 1);
+    gr_read_m(ds, L + "mlp_hyper_connection", mR_, mbo_, minj_[0], minj_[1], true, XF_, false, nf);
+    gm(L + "mlp.gate.weight", XF_, logits_, 512, nf);
     nb_ = true;
-    gm(L + "mlp.shared_expert.gate_proj.weight", XF_, gsh_, NFF, 1);
+    gm(L + "mlp.shared_expert.gate_proj.weight", XF_, gsh_, NFF, nf);
     nb_ = true;
-    gm(L + "mlp.shared_expert.up_proj.weight", XF_, ush_, NFF, 1);
+    gm(L + "mlp.shared_expert.up_proj.weight", XF_, ush_, NFF, nf);
     nb_ = true;
-    gm(L + "mlp.shared_expert_gate.weight", XF_, sg_, 1, 1);
+    gm(L + "mlp.shared_expert_gate.weight", XF_, sg_, 1, nf);
     {
         MoeArgs a{};
         const gguf::Tensor &tgu = TM(L + "mlp.experts.gate_up_proj"), &td = TM(L + "mlp.experts.down_proj");
@@ -3356,7 +3512,7 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         a.down_off = td.offset;
         a.gu_stride = (uint64_t) a.gu_row * 2 * NFF;
         a.d_stride = (uint64_t) a.d_row * N;
-        a.n_embd = N; a.n_ff = NFF; a.n_tok = 1; a.topk = TOPK; a.n_expert = NEXP;   // (the draft layer: its own 512 experts)
+        a.n_embd = N; a.n_ff = NFF; a.n_tok = (uint32_t) nf; a.topk = TOPK; a.n_expert = NEXP;   // (the draft layer: its own 512 experts)
         const bool dq2 = td.type == ref::Q2_0;
         const int gl = 32, gr = 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
@@ -3376,7 +3532,7 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
             mtl::Dispatch d;
             d.p = P(lib_, "swiglu_prep", {}, "swiglu_prep");
             d.args = {mtl::Arg::B(gsh_), mtl::Arg::B(ush_), mtl::Arg::B(XH_.b), mtl::Arg::V(ga)};
-            d.grid[0] = NFF / 16; d.grid[1] = 1; d.tg[0] = 16;
+            d.grid[0] = NFF / 16; d.grid[1] = nf; d.tg[0] = 16;
             nb_ = true;
             push(ds, d);
         }
@@ -3393,7 +3549,7 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         g.ind_off = P_IGU * 4;
         push(ds, g);
         nb_ = true;
-        gm(L + "mlp.shared_expert.down_proj.weight", XH_, ysh_, N, 1);
+        gm(L + "mlp.shared_expert.down_proj.weight", XH_, ysh_, N, nf);
         mtl::Dispatch dd;
         dd.p = P(lib_, dnn, {}, dnn);
         dd.args = {mtl::Arg::B(Wm_), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
@@ -3401,18 +3557,18 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
         dd.indirect = &plan_;
         dd.ind_off = P_IDN * 4;
         push(ds, dd);
-        GlueArgs ca{N, 1, N, TOPK};
+        GlueArgs ca{N, (uint32_t) nf, N, TOPK};
         mtl::Dispatch cb;
         cb.p = P(lib_, k_comb(), {}, k_comb());
         cb.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(mbo_), mtl::Arg::V(ca)};
-        cb.grid[0] = (N + 255) / 256; cb.tg[0] = 256;
+        cb.grid[0] = (nf * N + 255) / 256; cb.tg[0] = 256;
         push(ds, cb);
     }
     // the layer's write (R updated in place: the next draft step's input residual) and the final mixer
-    gr_read_m(ds, "mtp.hyper_connection_mixer", mR_, mbo_, minj_[1], minj_[0], true, XA_, true, 1);
+    gr_read_m(ds, "mtp.hyper_connection_mixer", mR_, mbo_, minj_[1], minj_[0], true, XA_, true, nf);
     const int64_t nv = dvocab_.empty() ? n_vocab_ : (int64_t) dvocab_.size();
-    if (dvocab_.empty()) gemv(ds, T("output.weight"), XA_, mlm_, (size_t) n_vocab_, 1);
-    else gemv(ds, mhead_t_, XA_, mlm_, (size_t) nv, 1, 0, &mhead_);
+    if (dvocab_.empty()) gemv(ds, T("output.weight"), XA_, mlm_, (size_t) n_vocab_, nf);
+    else gemv(ds, mhead_t_, XA_, mlm_, (size_t) nv, nf, 0, &mhead_);
     {
         ArgArgs a{(uint32_t) nv, 120};
         mtl::Dispatch d1, d2;
@@ -4252,6 +4408,10 @@ bool window_batch_mtp_on() { return g_the_window != nullptr && g_the_window->bat
 bool window_batch_draft_add(int slot, int row0, const int32_t* tokens, int64_t p, int a, int max_steps, std::string& err) {
     if (g_the_window == nullptr) { err = "metal mtp: no decode window"; return false; }
     return g_the_window->batch_draft_add(slot, row0, tokens, p, a, max_steps, err);
+}
+bool window_batch_draft_kv(int slot, int row0, const int32_t* tokens, int64_t p, int n, std::string& err) {
+    if (g_the_window == nullptr) { err = "metal mtp: no decode window"; return false; }
+    return g_the_window->batch_draft_kv(slot, row0, tokens, p, n, err);
 }
 bool window_batch_drafts_run(int32_t* drafts, float* probs, int* n_drafts, float min_p, std::string& err) {
     if (g_the_window == nullptr) { err = "metal mtp: no decode window"; return false; }

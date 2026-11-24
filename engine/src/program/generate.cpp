@@ -216,6 +216,9 @@ bool window_batch_mtp_on();
 // row0; queued, run by window_batch_drafts_run (with the commits' folds).  set = -1: the main sequence's draft K/V (admission)
 bool window_batch_draft_add(int slot, int row0, const int32_t* tokens, int64_t p, int a, int max_steps, std::string& err);
 bool window_batch_drafts_run(int32_t* drafts, float* probs, int* n_drafts, float min_p, std::string& err);
+// a slot that ended in the last batch window: its draft K/V for the n cells it kept (no round); queued with the rounds
+// (STRATA_METAL_BATCH_MTP_BDONE=0: off)
+bool window_batch_draft_kv(int slot, int row0, const int32_t* tokens, int64_t p, int n, std::string& err);
 }
 #endif
 
@@ -17321,8 +17324,10 @@ int main(int argc, char** argv) {
                     nan_flush = true;
                     continue;
                 }
+                int n_emitted = 0;   // (Metal --batch-mtp: the cells whose draft K/V the slot's last window leaves to write)
                 for (int j = 0; j < keep[b]; ++j) {
                     const int32_t y = outb[first[t] + j];
+                    ++n_emitted;
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
@@ -17376,6 +17381,11 @@ int main(int argc, char** argv) {
                 }
 #endif
 #if defined(STRATA_GPU_METAL)
+                if (batch_mtp && !sl.active && sl.cached &&   // it ended here: the draft K/V of the cells it kept, as a round would have written
+                    !strata::metal_engine::window_batch_draft_kv(b, first[t], outb + first[t], pos[first[t]], n_emitted, err)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                    return false;
+                }
                 if (batch_mtp && sl.active) {   // queued: every slot's round (and the commits' folds) in one command buffer below
                     if (!strata::metal_engine::window_batch_draft_add(b, first[t], outb + first[t], pos[first[t]], keep[b] - 1,
                                                                     o.spec - 1, err)) {

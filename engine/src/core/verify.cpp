@@ -111,6 +111,8 @@ const float* window_logits(void* w, int t);   // row t of the last window's head
 bool window_sample_slot_row(void* w, int row, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hist_len, int32_t* tok, std::string& err);
 bool window_init_slots(void* w, const std::vector<strata::core::SessionState*>& slots, std::string& err);
 bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
+// concurrent MTP (window.cpp): each slot's kept prefix of its rows of the last batch window (keep[b] for slot b); the folds are queued
+bool window_commit_rows(void* w, const int* keep, std::string& err);
 bool window_taps(void* w, const std::vector<int>& layers, const float** tap_dev, std::string& err);   // dflash2.inc
 }  // namespace strata::metal_engine
 #endif
@@ -5515,9 +5517,9 @@ bool Verifier::commit_slots(std::string& err) {
 
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)
-    (void) keep;   // (greedy one-row windows, committed by window_run_slots)
+    // one-row slots committed in window_run_slots; a slot with draft rows (concurrent MTP) keeps its prefix here
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
-    return true;
+    return strata::metal_engine::window_commit_rows(metal_, keep, err);
 #endif
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }

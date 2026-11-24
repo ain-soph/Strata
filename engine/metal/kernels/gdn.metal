@@ -35,6 +35,12 @@ constant int GDN_NTOK [[function_constant(2)]];
 // output are row y of the window's arrays.  Off: exactly the plain kernel.
 constant bool GDN_ROWS_C [[function_constant(31)]];
 constant bool gdn_rows = is_function_constant_defined(GDN_ROWS_C) && GDN_ROWS_C;
+// GDN_SEGS (function constant 33, with GDN_ROWS; concurrent MTP drafts): the rows of one slot are adjacent and in cell order (a
+// segment: the slot's token and its drafts).  The threadgroup of a segment's first row runs all of the segment's rows in order (as a
+// GDN_NTOK-token window would), the others return.  A one-row segment commits in the step (as GDN_ROWS); a longer one does not commit
+// (Window::commit_rows folds the kept prefix).  Off: exactly the GDN_ROWS kernel.
+constant bool GDN_SEGS_C [[function_constant(33)]];
+constant bool gdn_segs = gdn_rows && is_function_constant_defined(GDN_SEGS_C) && GDN_SEGS_C;
 
 struct GdnArgs {
     uint h_k;        // 16
@@ -63,7 +69,8 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
                      device float* hist_out [[buffer(12)]],
                      device const uint* rinfo [[buffer(13), function_constant(gdn_rows)]],
                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-                     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+                     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                     uint3 ntg [[threadgroups_per_grid]]) {
     constexpr int S = 128;
     threadgroup float qs[S], ks[S], vs[S];
     constexpr int RPT = S / IB;   // state rows per thread
@@ -76,6 +83,13 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
     const int j = 32 * cb + lane, i0 = RPT * ib;
     const float scale = 1.0f / sqrt(float(S));
     const int row0 = gdn_rows ? int(tg.y) : 0;
+    int nseg = GDN_NTOK;   // the rows this threadgroup runs
+    if (gdn_segs) {
+        const uint s0 = rinfo[8 + 4 * row0];
+        if (row0 > 0 && rinfo[8 + 4 * (row0 - 1)] == s0) return;   // not the first row of its segment (uniform per threadgroup)
+        nseg = 1;
+        while (row0 + nseg < int(ntg.y) && rinfo[8 + 4 * (row0 + nseg)] == s0) ++nseg;
+    }
     if (gdn_rows) {
         const ulong sl = rinfo[8 + 4 * row0], par = rinfo[8 + 4 * row0 + 2];
         state += sl * rinfo[5];
@@ -96,8 +110,9 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
     float st[RPT];
     for (int r = 0; r < RPT; ++r) st[r] = state[((i0 + r) * hv + h) * S + j];
 
-    const int commit_at = a.commit == 1u ? GDN_NTOK : (a.commit >> 8) ? int(a.commit & 0xFFu) : 0;
-    for (int t = 0; t < GDN_NTOK; ++t) {
+    const int commit_at = gdn_segs ? (a.commit == 1u && nseg == 1 ? 1 : 0)
+                        : a.commit == 1u ? GDN_NTOK : (a.commit >> 8) ? int(a.commit & 0xFFu) : 0;
+    for (int t = 0; t < (gdn_segs ? nseg : GDN_NTOK); ++t) {
         // conv + SiLU
         const int tr = t + row0;
         float cv = 0.0f;

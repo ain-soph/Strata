@@ -77,6 +77,11 @@ kernel void ple_gate_norm(device const float* key [[buffer(0)]], device const fl
 // stride rinfo[7] floats, row t at rinfo[8 + 4 t] = {slot, ...}); the three taps before the row itself always read the history.
 constant bool PLE_ROWS_C [[function_constant(32)]];
 constant bool ple_rows = is_function_constant_defined(PLE_ROWS_C) && PLE_ROWS_C;
+// PLE_SEGS (function constant 34, with PLE_ROWS; concurrent MTP drafts): the rows of one slot are adjacent and in cell order; row t
+// at place u of its segment reads the segment's earlier rows (norm_w) for the taps inside the window and its slot's history for the
+// rest, as a solo window does.  Off: exactly the PLE_ROWS kernel.
+constant bool PLE_SEGS_C [[function_constant(34)]];
+constant bool ple_segs = ple_rows && is_function_constant_defined(PLE_SEGS_C) && PLE_SEGS_C;
 
 kernel void ple_conv_add(device const float* hist [[buffer(0)]], device const float* norm_w [[buffer(1)]],
                          device const half* kw [[buffer(2)]], device const float* gated [[buffer(3)]],
@@ -86,10 +91,18 @@ kernel void ple_conv_add(device const float* hist [[buffer(0)]], device const fl
     const uint ch = tg.x * 256 + tid, t = tg.y, hcd = a.hc * a.n_embd;
     if (ch >= hcd) return;
     if (ple_rows) hist += ulong(rinfo[8 + 4 * t]) * rinfo[7];
+    uint u = 0;   // (PLE_SEGS) the row's place in its slot's segment
+    if (ple_segs) {
+        const uint s0 = rinfo[8 + 4 * t];
+        while (u < t && rinfo[8 + 4 * (t - u - 1)] == s0) ++u;
+    }
     float acc = 0.0f;
     for (int k = 0; k < 4; ++k) {
         float v;
-        if (ple_rows) {
+        if (ple_segs) {
+            const int p = int(u) - (3 - k) * 3;   // < 0: the slot's committed history
+            v = p >= 0 ? norm_w[(t - u + uint(p)) * hcd + ch] : hist[uint(9 + p) + 9 * ch];
+        } else if (ple_rows) {
             v = k == 3 ? norm_w[t * hcd + ch] : hist[uint(9 - (3 - k) * 3) + 9 * ch];
         } else {
             const int p = int(t) - (3 - k) * 3;   // the row this tap reads: < 0 = the committed history

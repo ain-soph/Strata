@@ -631,6 +631,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         return !(e && std::string(e) == "0");
     }();
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
+    flush_post();   // (concurrent MTP) a batch commit's queued folds land before a prompt runs on the state (none queued: no-op)
     const double t0 = now_ms();
     pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = pb_.hidden_ms = pb_.emb_ms = pb_.ple_ms = 0;
     bool keep_pc = false;

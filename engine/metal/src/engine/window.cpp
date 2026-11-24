@@ -2806,6 +2806,7 @@ void Window::reset() {
 bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
     pc_drain();
     flush_post();   // (concurrent MTP) the last commit's folds land before the restore writes the state
+    pend_segs_.clear();
     const size_t gs = GST_B, hs = HIST_B, ts = 3 * 4 * G_ID, tsw = TAIL_B, dsz = DEAD_B;
     if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) PLEH_B ||
         (c.tails.size() != tail_.size() * ts && c.tails.size() != tail_.size() * tsw) || c.dead.size() != dead_.size() * dsz) {

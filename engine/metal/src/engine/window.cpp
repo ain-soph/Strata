@@ -120,6 +120,55 @@ namespace {
 int g_slot_cap = 0;   // --batch N: the window keeps N + 1 sequences' running states side by side (set_batch_slots)
 int g_prompt_chunk_auto = 0;   // --prefill auto: the Metal prompt chunk's default (prompt_chunk_for_auto), else 0 (2048)
 
+// The routing trace on the Metal engine (--dump-routing PATH, or STRATA_METAL_DUMP_ROUTING=PATH; default off).  The record
+// format is the CPU pool's (generate.cpp drive_pool; terminal/tools/make_profile.py): int32 layer, int32 k, k int32 expert ids,
+// k float32 router weights.  Resident windows only: every layer's router writes its ids / weights into its own slice of one
+// buffer (no extra dispatch, no copy); the host writes the rows the engine keeps (a decode window's accepted prefix at commit,
+// every row of a batch window, every row of a prompt chunk), token by token, layers 0..47 each.  Off: nothing allocated, the
+// graphs are the ones without it.
+std::string g_dump_routing_path;
+std::FILE* g_dump_routing = nullptr;
+long long g_dump_records = 0;
+bool dump_routing_on() {
+    static const bool on = [] {
+        if (g_dump_routing_path.empty())
+            if (const char* e = std::getenv("STRATA_METAL_DUMP_ROUTING")) g_dump_routing_path = e;
+        if (g_dump_routing_path.empty()) return false;
+        g_dump_routing = std::fopen(g_dump_routing_path.c_str(), "wb");
+        if (g_dump_routing == nullptr) {
+            std::fprintf(stderr, "strata metal: cannot write the routing trace %s; no trace\n", g_dump_routing_path.c_str());
+            return false;
+        }
+        std::atexit([] {
+            if (g_dump_routing == nullptr) return;
+            std::fclose(g_dump_routing);
+            g_dump_routing = nullptr;
+            std::fprintf(stderr, "strata metal: routing trace %s: %lld records (layer, k, ids, weights)\n", g_dump_routing_path.c_str(),
+                         g_dump_records);
+        });
+        std::fprintf(stderr, "strata metal: routing trace -> %s\n", g_dump_routing_path.c_str());
+        return true;
+    }();
+    return on;
+}
+// n tokens' records: ids / weights at [layer][stride][k] (layer slices `stride` rows apart), token-major
+void dump_routing_rows(const int32_t* ids, const float* w, int n, int n_layers, int stride, int k) {
+    if (g_dump_routing == nullptr) return;
+    std::vector<uint8_t> buf((size_t) n * n_layers * (8 + 8 * (size_t) k));
+    uint8_t* o = buf.data();
+    for (int t = 0; t < n; ++t)
+        for (int l = 0; l < n_layers; ++l) {
+            const int32_t rec[2] = {l, k};
+            const size_t at = ((size_t) l * stride + t) * k;
+            std::memcpy(o, rec, 8); o += 8;
+            std::memcpy(o, ids + at, 4 * (size_t) k); o += 4 * (size_t) k;
+            std::memcpy(o, w + at, 4 * (size_t) k); o += 4 * (size_t) k;
+        }
+    std::fwrite(buf.data(), 1, buf.size(), g_dump_routing);
+    std::fflush(g_dump_routing);   // the server ends the engine with a signal: what was written stays written
+    g_dump_records += (long long) n * n_layers;
+}
+
 // Q4-KQ: the kernel sources define STRATA_KQ_DOWN to instantiate the K-quant / IQ4_XS / IQ3_S down experts (moe.metal, moe_mm.metal).
 // The host asks for them only when a layer's down tensor has one of those types, so a Flash-Next set (Q5_1 / Q5_0 / Q8_0 / IQ4_NL / Q2_0
 // downs) compiles the same kernel text as before and pays nothing for them.
@@ -144,6 +193,8 @@ constexpr int G_NL = geo::NL, G_QI = geo::QI, G_NGDN = geo::NGDN, G_SS = geo::SS
 constexpr size_t GST_B = (size_t) 4 * G_SS * G_HV * G_SS;                       // GDN recurrence
 constexpr size_t HIST_B = (size_t) 4 * G_CONV * 3;                              // GDN conv history
 constexpr size_t PLEH_B = (size_t) 4 * strata::kernels::NG_HIST * G_HCD;        // PLE history
+constexpr uint32_t DCNT_N = 256;                                               // moe_down_comb: row blocks (grid x) at most
+constexpr size_t DCNT_B = (size_t) 128 * DCNT_N;                                 // one counter a row block, 128 B apart (moeh.metal)
 constexpr size_t TAIL_B = (size_t) 4 * 4 * G_ID;                                // indexer raw tail (4 cells)
 constexpr size_t DEAD_B = (size_t) 4 * G_ID;                                    // indexer tail-block key
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
@@ -185,6 +236,42 @@ int metal_iq_dec_opt() {
         return e ? std::atoi(e) : 0;
     }();
     return mode;
+}
+// STRATA_METAL_IQ_HQ (default off; =1 on): the routed IQ2_S / IQ3_S gate/up decoded in half from pre-converted grid tables
+// (moeh.metal moe_guh): moe_gu's loop and FMA order on the same values, bitwise moe_gu's h.  STRATA_METAL_IQ_HQ_F16=1 (an
+// experiment, changes the numerics): the unit products in half (function constant 28).
+bool metal_iq_hq() {
+    static const bool on = std::getenv("STRATA_METAL_IQ_HQ") && std::string(std::getenv("STRATA_METAL_IQ_HQ")) == "1";
+    return on;
+}
+// the IQ_HQ gate/up's tile (STRATA_METAL_IQ_HQ_GU=L,R,S, default 32,2,4: the half decode leaves the registers for two rows a
+// simdgroup; M5 Ultra microbench IQ2_S 20.9 -> 19.1 us at 1 token, 49.9 -> 44.1 us at 3) and the types it takes
+// (STRATA_METAL_IQ_HQ_TYPES: 2 = IQ2_S, 3 = IQ3_S, 23 = both, the default)
+const int* metal_iq_hq_tile() {
+    static int t[3] = {32, 2, 4};
+    static const bool once = [] {
+        if (const char* e = std::getenv("STRATA_METAL_IQ_HQ_GU")) {
+            int o[3];
+            if (std::sscanf(e, "%d,%d,%d", &o[0], &o[1], &o[2]) == 3) { t[0] = o[0]; t[1] = o[1]; t[2] = o[2]; }
+        }
+        return true;
+    }();
+    (void) once;
+    return t;
+}
+bool metal_iq_hq_type(int type) {
+    static const std::string ty = std::getenv("STRATA_METAL_IQ_HQ_TYPES") ? std::getenv("STRATA_METAL_IQ_HQ_TYPES") : "23";
+    return (type == ref::IQ2_S && ty.find('2') != std::string::npos) || (type == ref::IQ3_S && ty.find('3') != std::string::npos);
+}
+bool metal_iq_hq_f16() {
+    static const bool on = std::getenv("STRATA_METAL_IQ_HQ_F16") && std::string(std::getenv("STRATA_METAL_IQ_HQ_F16")) == "1";
+    return on;
+}
+// STRATA_METAL_DOWN_COMB (default off; =1 on): the routed down and moe_combine_sh2 in one dispatch (moeh.metal
+// moe_down_comb: the last threadgroup of a row block combines it), one barrier group a layer fewer; bitwise the same bo
+bool metal_down_comb() {
+    static const bool on = std::getenv("STRATA_METAL_DOWN_COMB") && std::string(std::getenv("STRATA_METAL_DOWN_COMB")) == "1";
+    return on;
 }
 bool metal_iq_f16() {
     static const bool on = std::getenv("STRATA_METAL_IQ_F16") && std::string(std::getenv("STRATA_METAL_IQ_F16")) == "1";
@@ -275,6 +362,7 @@ struct PromptBufs {
         Wsg, Wshg, Wshu, Wshd, yf, Wcat, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv, mixr;
     // Buffer has no releasing destructor. Keep each allocation once for workspace growth.
     std::vector<mtl::Buffer> owned;
+    mtl::Buffer ids_all, wts_all;   // --dump-routing: every layer's routed ids / weights, [G_NL][C][TOPK]
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -488,7 +576,9 @@ private:
     // buffers
     mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
-        emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_, rcnt_;
+        emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_, rcnt_, dcnt_;
+    mtl::Buffer rids_all_, rwts_all_;   // --dump-routing: every layer's routed ids / weights, [G_NL][MAXT][TOPK]
+    bool dump_rt_ = false;              // ... on (resident windows)
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
     mtl::Buffer h16_;   // STRATA_METAL_F16: the routed gate/up's h as half, for the down
     int cur_inj_ = 0;
@@ -861,7 +951,12 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * G_CONV); z_ = A(4 * MAXT * G_ZV);
     al_ = A(4 * MAXT * G_HV); be_ = A(4 * MAXT * G_HV); yg_ = A(4 * MAXT * G_ZV); logits_ = A(4 * MAXT * 512);
-    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); h_ = A(4 * MAXT * TOPK * NFF);
+    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); dcnt_ = A(DCNT_B); h_ = A(4 * MAXT * TOPK * NFF);
+    dump_rt_ = !stream_ && dump_routing_on();
+    if (stream_ && (!g_dump_routing_path.empty() || std::getenv("STRATA_METAL_DUMP_ROUTING")))
+        std::fprintf(stderr, "strata metal: --dump-routing / STRATA_METAL_DUMP_ROUTING: not written when the experts stream from the SSD "
+                             "(resident windows only); no trace\n");
+    if (dump_rt_) { rids_all_ = A(4 * (size_t) G_NL * MAXT * TOPK); rwts_all_ = A(4 * (size_t) G_NL * MAXT * TOPK); }
     ye_ = A(4 * MAXT * TOPK * N); gsh_ = A(4 * MAXT * NFF); ush_ = A(4 * MAXT * NFF); ysh_ = A(4 * MAXT * N);
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * G_QFULL); kcur_ = A(4 * MAXT * G_KV); vcur_ = A(4 * MAXT * G_KV);
     iqr_ = A(4 * MAXT * G_IQR); ikr_ = A(4 * MAXT * G_ID); qcur_ = A(4 * MAXT * G_QOUT); qidx_ = A(4 * MAXT * G_IH * G_ID);
@@ -1398,6 +1493,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
                            !needs_xprep_extra(tshinp.type) && !needs_xprep_extra(tg_.type) && !needs_xprep_extra(tu.type);
     gr_read(ds, b + "hc_ffn", true, XF_, false, ntok, raw_ffn, false);
     const bool need_bo = (taps_on_ && tap_slot_[l] >= 0) || !metal_combine_fuse();
+    bool dcomb = false;   // moe_down_comb wrote bo_
     {
         MoeArgs a{};
         a.gate_off = tg_.offset;
@@ -1443,9 +1539,16 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const bool use_tg_gu = use_iq_gu && ((tg_.type == ref::IQ2_S && (tg_mode == 1 || tg_mode == 2)) ||
                                              (tg_.type == ref::IQ3_S && (tg_mode == 1 || tg_mode == 3)));
         if (use_iq_gu && !gu_e) { gl = 16; gr = 1; gs = 4; }
+        const bool use_hq = !m16 && !use_iq_gu && !stream_ && metal_iq_hq() && tu.type == tg_.type &&
+                            (tg_.type == ref::IQ2_S || tg_.type == ref::IQ3_S) && metal_iq_hq_type(tg_.type) && !had_gu(l);
+        if (use_hq && !gu_e) { const int* t = metal_iq_hq_tile(); gl = t[0]; gr = t[1]; gs = t[2]; }
         a.gx_gu = NFF / (gs * (32 / gl) * gr);
         a.gx_dn = N / (ds_ * (32 / dl) * dr);
 
+        // --dump-routing: this layer's slice of rids_all_ / rwts_all_ (nothing else in a resident window reads ids_ / wts_)
+        const size_t rt_off = (size_t) l * MAXT * TOPK * 4;
+        const mtl::Arg rt_ids = dump_rt_ ? mtl::Arg::B(rids_all_, rt_off) : mtl::Arg::B(ids_);
+        const mtl::Arg rt_wts = dump_rt_ ? mtl::Arg::B(rwts_all_, rt_off) : mtl::Arg::B(wts_);
         const bool can_rfuse = metal_router_fuse() && !stream_ && (trt.type == ref::F32 || trt.type == ref::BF16) &&
                                tgs.type == ref::Q8_0 && tus.type == ref::Q8_0 && tds.type == ref::Q8_0 &&
                                !f16_enc_ && !had_gu(l);
@@ -1456,7 +1559,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
             rr.p = P(lib_, rfn, mtl::Constants().i(0, ntok), rfn + "#" + std::to_string(ntok));
             rr.args = {mtl::Arg::B(W_, trt.offset), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(trt.type)),
                        mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4), mtl::Arg::B(logits_), mtl::Arg::V(ga),
-                       mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(rcnt_)};
+                       rt_ids, rt_wts, mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(rcnt_)};
             rr.grid[0] = (uint32_t) ((nexp_ + 15) / 16);
             rr.tg[0] = 512;
             push(ds, rr);
@@ -1497,7 +1600,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
             gemv(ds, tshinp, XF_, sg_, 1, ntok);
             mtl::Dispatch r;
             r.p = P(lib_, "moe_route", {}, "moe_route");
-            r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
+            r.args = {mtl::Arg::B(logits_), rt_ids, rt_wts, mtl::Arg::B(plan_), mtl::Arg::V(a)};
             r.tg[0] = 512;
             push(ds, r);
             {
@@ -1515,7 +1618,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const std::string gun = m16
             ? ("moe_gu16_" + std::to_string(tg_.type) + "_" + std::to_string(gl) + "_" + std::to_string(gr) + "_" + std::to_string(gs))
             : (use_iq_gu ? std::string(use_tg_gu ? "moe_gu_opt_tg_" : "moe_gu_opt_")
-                         : std::string("moe_gu_")) +
+                         : std::string(use_hq ? "moe_guh_" : "moe_gu_")) +
                   std::to_string(tg_.type) + "_" + std::to_string(gl) + "_" + std::to_string(gr) + "_" + std::to_string(gs);
         const std::string dnn = m16
             ? ("moe_down16_" + std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" + std::to_string(dr) + "_" + std::to_string(ds_))
@@ -1530,10 +1633,12 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         ac.b(23, ct);
         mtl::Constants ac_gu = ac;
         if (use_iq_gu && iqf16) ac_gu.b(26, true);
+        const bool hqf16 = use_hq && metal_iq_hq_f16();
+        if (hqf16) ac_gu.b(28, true);
         mtl::Constants ac_dn = ac;
         if (use_iq_dn && iqf16) ac_dn.b(26, true);
         const std::string ak = std::string(stream_ ? "#arena" : "") + (ct ? "#ct" : "");
-        g.p = m16 ? P(lib_, gun, {}, gun) : P(lib_, gun, ac_gu, gun + ak + (use_iq_gu && iqf16 ? "#if16" : ""));
+        g.p = m16 ? P(lib_, gun, {}, gun) : P(lib_, gun, ac_gu, gun + ak + (use_iq_gu && iqf16 ? "#if16" : "") + (hqf16 ? "#hq16" : ""));
         const bool hg = had_gu(l), hd = had_dn(l);
         if (hg) had_rows(ds, lib_, "d:", XF_.b, 0, XR_, 0, ntok, N, hsx_.handle ? &hsx_ : nullptr, false);   // before the host's turn
         g.args = {mtl::Arg::B(EW, ebase), hg ? mtl::Arg::B(XR_) : mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tg_.type)), mtl::Arg::B(h_),
@@ -1556,6 +1661,15 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         mtl::Dispatch dd;
         dd.p = m16 ? P(lib_, dnn, {}, dnn) : P(lib_, dnn, ac_dn, dnn + ak + (use_iq_dn && iqf16 ? "#if16" : ""));
         dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
+        // the combine folded into the down (moe_down_comb): the plain resident path with a combine to do
+        dcomb = need_bo && !m16 && !use_iq_dn && !stream_ && !hd && metal_down_comb() && td.type == ref::IQ4_NL &&
+                (dl == 4 || dl == 8) && (dr == 1 || dr == 2) && ds_ == 4 && ntok <= MAXT && a.gx_dn <= DCNT_N;
+        if (dcomb) {
+            const std::string dcn = "moe_down_comb_" + std::to_string(td.type) + "_" + std::to_string(dl) + "_" + std::to_string(dr) + "_" + std::to_string(ds_);
+            dd.p = P(lib_, dcn, ac_dn, dcn + ak);
+            dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_),
+                       mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::B(dcnt_)};
+        }
         if (m16) dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h16_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
         if (stream_)
             for (int c = -1; c < 3; ++c)
@@ -1565,7 +1679,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         dd.ind_off = P_IDN * 4;
         push(ds, dd);
     }
-    if (need_bo) {
+    if (need_bo && !dcomb) {
         GlueArgs a{N, (uint32_t) ntok, N, TOPK};
         mtl::Dispatch d;
         d.p = P(lib_, k_comb(), {}, k_comb());
@@ -1851,6 +1965,7 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
     win_gpu_[Tn] += last_gpu_ms_;
     for (int t = 0; t < Tn; ++t) out[t] = tokout_.as<int32_t>()[t];
     head_rows_ = Tn;   // the batch window's head wrote Tn logits rows (the #879 scan reads them)
+    if (dump_rt_) dump_routing_rows(rids_all_.as<int32_t>(), rwts_all_.as<float>(), Tn, G_NL, MAXT, TOPK);   // each row one slot's token
     for (int t = 0; t < Tn; ++t) {
         SeqSet& s = *sets_[(size_t) rows_set_[t]];
         s.hp = 1 - s.hp;
@@ -2159,7 +2274,8 @@ void Window::stepprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
     for (size_t li = 0; li < routes.size(); ++li) {
         cx_->run_graph(ds, routes[li] + 1);
         std::set<int> u;
-        for (int k = 0; k < Tn * TOPK; ++k) { const int v = ids_.as<int32_t>()[k]; if (v >= 0) u.insert(v); }
+        const int32_t* rid = dump_rt_ ? rids_all_.as<int32_t>() + li * MAXT * TOPK : ids_.as<int32_t>();   // (--dump-routing: the layer's slice)
+        for (int k = 0; k < Tn * TOPK; ++k) { const int v = rid[k]; if (v >= 0) u.insert(v); }
         distinct.push_back((int) u.size());
     }
     auto expert_bytes = [&](size_t layer, bool gu, bool dn) {
@@ -2636,6 +2752,7 @@ void Window::reset() {
         zero(ghist_[1][i], HIST_B);
     }
     zero(pleHist_, PLEH_B);
+    zero(dcnt_, DCNT_B);   // moe_down_comb's row-block counters (each winner resets its own; this covers an aborted window)
     for (size_t j = 0; j < tail_.size(); ++j) {
         zero(tail_[j], TAIL_B);
         zero(dead_[j], DEAD_B);
@@ -2712,6 +2829,7 @@ bool Window::commit(int n_keep, std::string& err) {
             hp_ = 1 - hp_;
         }
     }
+    if (dump_rt_) dump_routing_rows(rids_all_.as<int32_t>(), rwts_all_.as<float>(), n_keep, G_NL, MAXT, TOPK);   // the kept rows
     strata::core::SessionState& ss = *ss_;
     for (int t = 0; t < n_keep; ++t) {
         if (ple_on_) {
@@ -3822,6 +3940,7 @@ void window_register(void* w);
 bool mtp_load_pending(Window* w, std::string& err);
 void set_model_shard(const char* shard1) { g_shard1 = shard1 ? shard1 : ""; }
 void set_batch_slots(int n) { g_slot_cap = n > 0 ? std::min(n, 8) : 0; }
+void set_dump_routing(const char* path) { g_dump_routing_path = path ? path : ""; }   // before the window starts (--dump-routing)
 // --prefill auto (generate.cpp).  The Metal prompt path never borrows expert-cache slots, but auto took the CUDA fallback for
 // "nothing lendable" (1024 tokens a call): every prompt() call was one Metal chunk, so the next chunk's embedding and PLE rows
 // (the hostpipe) never ran beside the GPU.  Auto keeps the buffers it always had (1024 rows, or STRATA_METAL_PROMPT_CHUNK) and

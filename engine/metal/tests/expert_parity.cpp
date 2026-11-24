@@ -109,7 +109,7 @@ void random_routing(ref::Rng& r, int ntok, int n_expert, std::vector<int>& ids, 
 }
 
 struct Kernels {
-    mtl::Pipeline plan, gu, dn, comb, prep;
+    mtl::Pipeline plan, gu, dn, comb, prep, comb2;
     Cfg cgu, cdn;
 };
 int xkind(int t) {
@@ -149,6 +149,19 @@ const bool g_iq_opt = std::getenv("EXPERT_IQ_OPT") && std::string(std::getenv("E
 const bool g_iq_f16 = std::getenv("EXPERT_IQ_F16") && std::string(std::getenv("EXPERT_IQ_F16")) == "1";
 const bool g_iq_tg = std::getenv("EXPERT_IQ_TG") && std::string(std::getenv("EXPERT_IQ_TG")) == "1";
 const mtl::Buffer* g_h16 = nullptr;
+// decode-opt 2026-11-23: EXPERT_HQ=1 the IQ2_S / IQ3_S gate/up decoded in half (moeh.metal moe_guh; EXPERT_HQ_F16=1 the half-product
+// arm, function constant 28); EXPERT_DCOMB=1 the down with the combine folded in (moe_down_comb).  With either, the parity run
+// also checks the candidate against the production kernels (moe_gu, moe_down + moe_combine_sh2) bit for bit, EXPERT_ITERS times
+// with fresh routings (default 1).
+const bool g_hq = std::getenv("EXPERT_HQ") && std::string(std::getenv("EXPERT_HQ")) == "1";
+const bool g_hq_f16 = std::getenv("EXPERT_HQ_F16") && std::string(std::getenv("EXPERT_HQ_F16")) == "1";
+const bool g_dcomb = std::getenv("EXPERT_DCOMB") && std::string(std::getenv("EXPERT_DCOMB")) == "1";
+// bench: EXPERT_BENCH_COMB=1 times moe_down + moe_combine_sh2 as the down (the work moe_down_comb replaces)
+const bool g_bench_comb = std::getenv("EXPERT_BENCH_COMB") && std::string(std::getenv("EXPERT_BENCH_COMB")) == "1";
+const mtl::Buffer *g_ysh = nullptr, *g_sgl = nullptr, *g_bo = nullptr, *g_cnt = nullptr;
+// moe_down_comb's counters: one uint a row block, 128 B apart (window.cpp DCNT_*)
+constexpr int DCNT_N = 256, DCNT_STRIDE = 32;
+constexpr size_t DCNT_B = (size_t)4 * DCNT_STRIDE * DCNT_N;
 
 void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::Buffer& W, size_t w_off,
                   const mtl::Buffer& x, const mtl::Buffer& h, const mtl::Buffer& ye, const mtl::Buffer& y,
@@ -197,10 +210,24 @@ void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::B
                   dk ? mtl::Arg::B(XPH, 4 * PLANE_H * dk) : mtl::Arg::B(h), mtl::Arg::B(ye),
                   mtl::Arg::B(plan, plan_off), mtl::Arg::V(a), mtl::Arg::B(XPH, 4 * PLANE_H * 4)};
         if (g_f16) d.args = {mtl::Arg::B(W, w_off), mtl::Arg::B(*g_h16), mtl::Arg::B(ye), mtl::Arg::B(plan, plan_off), mtl::Arg::V(a)};
+        if (g_dcomb && g_ysh) {
+            d.args.push_back(mtl::Arg::B(*g_ysh)); d.args.push_back(mtl::Arg::B(*g_sgl));
+            d.args.push_back(mtl::Arg::B(*g_bo)); d.args.push_back(mtl::Arg::B(*g_cnt));
+        }
         d.tg[0] = K.cdn.S * 32;
         d.indirect = &plan;
         d.ind_off = plan_off + P_IDN * 4;
         ds.push_back(d);
+        if (g_bench_comb && !g_dcomb && g_ysh) {
+            static uint32_t ga[4];
+            ga[0] = (uint32_t)N_EMBD; ga[1] = a.n_tok; ga[2] = (uint32_t)N_EMBD; ga[3] = (uint32_t)TOPK;
+            mtl::Dispatch c;
+            c.p = &K.comb2;
+            c.args = {mtl::Arg::B(ye), mtl::Arg::B(plan, plan_off), mtl::Arg::B(*g_ysh), mtl::Arg::B(*g_sgl), mtl::Arg::B(*g_bo), mtl::Arg::V(ga)};
+            c.grid[0] = (a.n_tok * N_EMBD + 255) / 256;
+            c.tg[0] = 256;
+            ds.push_back(c);
+        }
     }
     if (with_comb) {
         mtl::Dispatch d;
@@ -288,7 +315,7 @@ int main(int argc, char** argv) {
     }
     // the host defines STRATA_KQ_DOWN only for a model whose downs are K-quant / IQ4_XS / IQ3_S (window.cpp kq_down_prelude)
     const bool kq_dn = dn == ref::Q2_K || dn == ref::Q3_K || dn == ref::Q4_K || dn == ref::Q5_K || dn == ref::Q6_K || dn == ref::IQ3_S || dn == ref::IQ4_XS;
-    const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal"},
+    const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal", "moeh.metal", "glue.metal"},
                                std::string(g_f16 ? "#define STRATA_METAL_F16 1\n" : "") + (kq_dn ? "#define STRATA_KQ_DOWN 1\n" : ""));
     const Layout L = layout(gu, dn);
     // Gyro: the pack's hadamard.txt (the signs of the widths 2560 and 640) -> the engine's CPU spec (the reference)
@@ -440,17 +467,20 @@ int main(int argc, char** argv) {
         K.comb = cx.pipeline(lib, "moe_combine");
         const bool opt_gu = g_iq_opt && !g_f16 && (gu == ref::IQ2_S || gu == ref::IQ3_S);
         const bool opt_dn = false;
+        const bool hq_gu = g_hq && !opt_gu && !g_f16 && (gu == ref::IQ2_S || gu == ref::IQ3_S);
         const std::string guk = opt_gu ? (g_iq_tg ? kname("moe_gu_opt_tg", gu, a) : kname("moe_gu_opt", gu, a))
-                                       : kname(g_f16 ? "moe_gu16" : "moe_gu", gu, a);
+                                       : kname(g_f16 ? "moe_gu16" : (hq_gu ? "moe_guh" : "moe_gu"), gu, a);
         const std::string dnk = opt_dn ? kname("moe_down_opt", dn, b)
                                        : kname(g_f16 ? "moe_down16" : "moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, b);
         mtl::Constants gc = mtl::Constants().i(22, std::getenv("MOE_PROBE") ? std::atoi(std::getenv("MOE_PROBE")) : 0)
                                             .b(23, std::getenv("QUANT_CTAB") != nullptr);
         mtl::Constants dc;
         if (opt_gu && g_iq_f16) gc.b(26, true);
+        if (hq_gu && g_hq_f16) gc.b(28, true);
         if (opt_dn && g_iq_f16) dc.b(26, true);
         K.gu = cx.pipeline(lib, guk, gc);
-        K.dn = cx.pipeline(lib, dnk, dc);
+        K.dn = cx.pipeline(lib, g_dcomb ? kname("moe_down_comb", dn, b) : dnk, g_dcomb ? mtl::Constants().b(23, true) : dc);
+        K.comb2 = cx.pipeline(lib, "moe_combine_sh2");
         K.cgu = a;
         K.cdn = b;
         if (std::getenv("PIPE_INFO"))
@@ -506,6 +536,122 @@ int main(int argc, char** argv) {
         cx.run({prep_dispatch(pp, x, XPX, N_EMBD, 8)});
     }
 
+    if (!bench && (g_hq || g_dcomb)) {
+        // ---------------- candidate vs production kernels, bitwise ----------------
+        const int NE = tg_ && experts_first ? std::max(experts_first, 2 * TOPK) : 64;
+        mtl::Buffer W = cx.alloc(L.blob * NE);
+        {
+            std::vector<int> pick;
+            for (int e = 0; e < NE; ++e) {
+                uint8_t* b = W.as<uint8_t>() + e * L.blob;
+                if (tg_) {
+                    int ex;
+                    if (experts_first) ex = e % experts_first;
+                    else do ex = (int)(rng.next() % 512); while (std::find(pick.begin(), pick.end(), ex) != pick.end());
+                    pick.push_back(ex);
+                    std::memcpy(b, (const uint8_t*)gf.map + tg_->offset + (size_t)ex * L.gu_row * N_FF, L.gu_row * N_FF);
+                    std::memcpy(b + L.up_off, (const uint8_t*)gf.map + tu_->offset + (size_t)ex * L.gu_row * N_FF, L.gu_row * N_FF);
+                    std::memcpy(b + L.down_off, (const uint8_t*)gf.map + td_->offset + (size_t)ex * L.d_row * N_EMBD, L.d_row * N_EMBD);
+                } else {
+                    ref::random_blocks(gu, b, 2 * N_FF, N_EMBD, 1000 + e + 100 * (seed - 1));
+                    ref::random_blocks(dn, b + L.down_off, N_EMBD, N_FF, 5000 + e + 100 * (seed - 1));
+                }
+            }
+        }
+        const bool hq_gu = g_hq && (gu == ref::IQ2_S || gu == ref::IQ3_S);
+        mtl::Pipeline p_plan = cx.pipeline(lib, "moe_plan");
+        mtl::Constants gc = mtl::Constants().b(23, true);   // production: QUANT_CTAB on
+        mtl::Pipeline p_gu = cx.pipeline(lib, kname("moe_gu", gu, cgu), gc);
+        // EXPERT_HQ_CFG=L,R,S: the candidate gate/up's tile (the base keeps --gucfg, production's 32,1,4)
+        Cfg cguc = cgu;
+        if (const char* e = std::getenv("EXPERT_HQ_CFG")) cguc = parse_cfg(e);
+        mtl::Pipeline p_guc = hq_gu ? cx.pipeline(lib, kname("moe_guh", gu, cguc), g_hq_f16 ? mtl::Constants().b(23, true).b(28, true) : gc)
+                                    : cx.pipeline(lib, kname("moe_gu", gu, cguc), gc);
+        mtl::Pipeline p_dn = cx.pipeline(lib, kname("moe_down", dn, cdn), gc);
+        mtl::Pipeline p_dnc = g_dcomb ? cx.pipeline(lib, kname("moe_down_comb", dn, cdn), gc) : p_dn;
+        mtl::Pipeline p_comb = cx.pipeline(lib, "moe_combine_sh2");
+        const int maxe = 8 * TOPK;
+        mtl::Buffer hb = cx.alloc(4 * maxe * N_FF), hc = cx.alloc(4 * maxe * N_FF), yeb = cx.alloc(4 * maxe * N_EMBD),
+                    yec = cx.alloc(4 * maxe * N_EMBD), ysh = cx.alloc(4 * 8 * N_EMBD), sgl = cx.alloc(4 * 8 * 4),
+                    plan = cx.alloc(4 * P_INTS), cnt = cx.alloc(DCNT_B);
+        // EXPERT_CHAIN=n: n layers a command buffer (the decode window's shape: one plan / h / ye reused by every layer, barriers
+        // between dispatches, concurrent encoder), each with its own routing and its own bo rows; every layer's bo is compared
+        const int chain = std::max(1, std::getenv("EXPERT_CHAIN") ? std::atoi(std::getenv("EXPERT_CHAIN")) : 1);
+        mtl::Buffer bob = cx.alloc(4 * 8 * N_EMBD * chain), boc = cx.alloc(4 * 8 * N_EMBD * chain),
+                    bid = cx.alloc(4 * 8 * TOPK * chain), bw = cx.alloc(4 * 8 * TOPK * chain);
+        for (int i = 0; i < 8 * N_EMBD; ++i) ysh.as<float>()[i] = rng.sym();
+        for (int i = 0; i < 8; ++i) sgl.as<float>()[i] = 3.0f * rng.sym();
+        const int iters = std::getenv("EXPERT_ITERS") ? std::atoi(std::getenv("EXPERT_ITERS")) : 1;
+        struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
+        long dh = 0, dbo = 0, bad_cnt = 0;
+        for (int it = 0; it < iters; ++it) {
+            const int nt = ntok > 0 ? ntok : 1;
+            for (int l = 0; l < chain; ++l) {
+                std::vector<int> ids;
+                std::vector<float> w;
+                random_routing(rng, nt, NE, ids, w, 0.3);
+                std::memcpy(bid.as<int>() + l * 8 * TOPK, ids.data(), 4 * ids.size());
+                std::memcpy(bw.as<float>() + l * 8 * TOPK, w.data(), 4 * w.size());
+            }
+            MoeArgs a{};
+            a.gate_off = 0; a.up_off = L.up_off; a.down_off = L.down_off; a.gu_stride = L.blob; a.d_stride = L.blob;
+            a.gu_row = (uint32_t)L.gu_row; a.d_row = (uint32_t)L.d_row; a.n_embd = N_EMBD; a.n_ff = N_FF; a.n_tok = nt;
+            a.topk = TOPK; a.n_expert = 512; a.gx_gu = N_FF / rows_per_tg(cgu); a.gx_dn = N_EMBD / rows_per_tg(cdn);
+            GlueArgs ga{(uint32_t)N_EMBD, (uint32_t)nt, (uint32_t)N_EMBD, (uint32_t)TOPK};
+            const MoeArgs a0 = a;
+            MoeArgs ac = a;
+            ac.gx_gu = N_FF / rows_per_tg(cguc);
+            auto layer = [&](const mtl::Pipeline& pg, const mtl::Pipeline& pd, bool fused, const mtl::Buffer& hh, const mtl::Buffer& ye,
+                             const mtl::Buffer& bob_, const Cfg& cg) {
+              const MoeArgs& a = &cg == &cguc ? ac : a0;
+              std::vector<mtl::Dispatch> ds;
+              for (int l = 0; l < chain; ++l) {
+                const size_t bo_off = (size_t)4 * 8 * N_EMBD * l;
+                const mtl::Buffer& bo = bob_;
+                mtl::Dispatch d0;
+                d0.p = &p_plan;
+                d0.args = {mtl::Arg::B(bid, (size_t)4 * 8 * TOPK * l), mtl::Arg::B(bw, (size_t)4 * 8 * TOPK * l), mtl::Arg::B(plan), mtl::Arg::V(a)};
+                d0.tg[0] = 512;
+                ds.push_back(d0);
+                mtl::Dispatch d1;
+                d1.p = &pg;
+                d1.args = {mtl::Arg::B(W), mtl::Arg::B(XPX, 0), mtl::Arg::B(hh), mtl::Arg::B(plan), mtl::Arg::V(a), mtl::Arg::B(XPX, 4 * PLANE_X * 4)};
+                d1.tg[0] = cg.S * 32; d1.indirect = &plan; d1.ind_off = P_IGU * 4;
+                ds.push_back(d1);
+                mtl::Dispatch d2;
+                d2.p = &pd;
+                d2.args = {mtl::Arg::B(W), mtl::Arg::B(hh), mtl::Arg::B(ye), mtl::Arg::B(plan), mtl::Arg::V(a), mtl::Arg::B(hh)};
+                if (fused) { d2.args.push_back(mtl::Arg::B(ysh)); d2.args.push_back(mtl::Arg::B(sgl)); d2.args.push_back(mtl::Arg::B(bo, bo_off)); d2.args.push_back(mtl::Arg::B(cnt)); }
+                d2.tg[0] = cdn.S * 32; d2.indirect = &plan; d2.ind_off = P_IDN * 4;
+                ds.push_back(d2);
+                if (!fused) {
+                    mtl::Dispatch d3;
+                    d3.p = &p_comb;
+                    d3.args = {mtl::Arg::B(ye), mtl::Arg::B(plan), mtl::Arg::B(ysh), mtl::Arg::B(sgl), mtl::Arg::B(bo, bo_off), mtl::Arg::V(ga)};
+                    d3.grid[0] = (nt * N_EMBD + 255) / 256; d3.tg[0] = 256;
+                    ds.push_back(d3);
+                }
+              }
+              if (chain > 1) cx.run_graph(ds, ds.size()); else cx.run(ds);
+            };
+            std::memset(bob.ptr, 0xff, 4 * 8 * N_EMBD * chain);
+            std::memset(boc.ptr, 0xff, 4 * 8 * N_EMBD * chain);
+            layer(p_gu, p_dn, false, hb, yeb, bob, cgu);
+            layer(p_guc, p_dnc, g_dcomb, hc, yec, boc, cguc);
+            const int nent = nt * TOPK;
+            for (int i = 0; i < nent * N_FF; ++i) dh += std::memcmp(hb.as<float>() + i, hc.as<float>() + i, 4) != 0;
+            for (int l = 0; l < chain; ++l)
+                for (int i = 0; i < nt * N_EMBD; ++i)
+                    dbo += std::memcmp(bob.as<float>() + l * 8 * N_EMBD + i, boc.as<float>() + l * 8 * N_EMBD + i, 4) != 0;
+            for (int i = 0; i < DCNT_N; ++i) bad_cnt += cnt.as<uint32_t>()[i * DCNT_STRIDE] != 0;
+        }
+        const bool ok = (g_hq_f16 || dh == 0) && dbo == (g_hq_f16 ? dbo : 0) && bad_cnt == 0;
+        std::printf("vs-base %s/%s ntok %d gu %s%s %d,%d,%d (base %d,%d,%d) dn %s %d,%d,%d, %d iters x %d layers: h differ %ld, bo differ %ld, counters left %ld  %s\n",
+                    ref::type_name(gu), ref::type_name(dn), ntok, hq_gu ? "moe_guh" : "moe_gu", g_hq_f16 ? "(f16)" : "", cguc.L, cguc.R, cguc.S,
+                    cgu.L, cgu.R, cgu.S, g_dcomb ? "moe_down_comb" : "moe_down+comb", cdn.L, cdn.R, cdn.S, iters, chain, dh, dbo, bad_cnt, ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+        if (g_dcomb) return 0;   // the parity below binds no combine buffers (moe_down_comb's 6..9)
+    }
     if (!bench) {
         // ---------------- parity ----------------
         const int NE = tg_ && experts_first ? std::max(experts_first, 2 * TOPK) : 64;
@@ -607,6 +753,8 @@ int main(int argc, char** argv) {
     }
 
     // ---------------- bench ----------------
+    mtl::Buffer b_ysh = cx.alloc(4 * 8 * N_EMBD), b_sgl = cx.alloc(4 * 8 * 4), b_bo = cx.alloc(4 * 8 * N_EMBD), b_cnt = cx.alloc(DCNT_B);
+    g_ysh = &b_ysh; g_sgl = &b_sgl; g_bo = &b_bo; g_cnt = &b_cnt;
     const int NE = 512;
     const size_t layer_bytes = L.blob * NE;
     std::printf("arena: %d layers x %d experts = %.2f GB (max buffer %.1f GB)\n", layers, NE, layers * layer_bytes / 1e9,

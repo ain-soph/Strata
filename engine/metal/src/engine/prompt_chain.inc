@@ -139,6 +139,7 @@ bool Window::pc_setup(int C) {
     b.qids = alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * G_QH * (G_QD + 2)); b.XQ = F32(4 * MT * G_QOUT + MT * G_QOUT / 16);
     b.xqh = F16(MT * G_QOUT);
     b.logits = F32(MT * nexp_); b.ids = alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
+    if (dump_rt_) { b.ids_all = alloc(4 * (size_t) G_NL * MT * TOPK); b.wts_all = F32((size_t) G_NL * MT * TOPK); }   // --dump-routing
     b.bcnt = alloc(4 * (size_t) nblk_max * nexp_); b.boff = alloc(4 * (size_t) nblk_max * nexp_);
     b.eoff = alloc(4 * nexp_); b.tiles = alloc(8 * (size_t) (b.maxrows / b.tm + 1)); b.meta = alloc(64);
     b.stok = alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = alloc(4 * MT * TOPK);
@@ -457,7 +458,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         dq(T(bl + "ffn_down_shexp.weight"), b.Wshd);
         gemm(b.mixh, b.Wr, b.logits, nT, nexp_, N);
         const uint32_t nt = (uint32_t) nT;
-        D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt), mtl::Arg::V((uint32_t) nexp_)}, (nT + 7) / 8, 1, 256);
+        // --dump-routing: the layer's slice of ids_all / wts_all, read by mm_hist / mm_place as b.ids / b.wts are
+        const size_t rt_off = dump_rt_ ? (size_t) l * b.C * TOPK * 4 : 0;
+        const mtl::Buffer& rt_ids = dump_rt_ ? b.ids_all : b.ids;
+        const mtl::Buffer& rt_wts = dump_rt_ ? b.wts_all : b.wts;
+        D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(rt_ids, rt_off), mtl::Arg::B(rt_wts, rt_off), mtl::Arg::V(nt), mtl::Arg::V((uint32_t) nexp_)}, (nT + 7) / 8, 1, 256);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
         // this layer's tiles and the grid x each one is dispatched over, computed together (src/moe_tiles.h)
         const MoeTile gu2 = gu2_tile(eg.type), dn2 = dn2_tile(ed.type);
@@ -466,10 +471,10 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                         (uint32_t) (b.v3e ? moe_grid_x(N, b.dn3[1], b.dn3[3]) : moe_grid_x(N, dn2.tn))};
         const uint32_t nclr = (uint32_t) b.maxrows;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
-        D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
+        D(P_(b.lib, "mm_hist"), {mtl::Arg::B(rt_ids, rt_off), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
         D(P_(b.lib, b.v6 ? "mm_scan6" : "mm_scan"), {mtl::Arg::B(b.bcnt), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.tiles), mtl::Arg::B(b.meta),
                                 mtl::Arg::V(pa)}, 1, 1, nexp_);
-        D(P_(b.lib, "mm_place"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.stok),
+        D(P_(b.lib, "mm_place"), {mtl::Arg::B(rt_ids, rt_off), mtl::Arg::B(rt_wts, rt_off), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.stok),
                                  mtl::Arg::B(b.sw), mtl::Arg::B(b.pos), mtl::Arg::V(pa)}, nblk, 1, 1024);
         PcMmArgs ma{eg.offset, eu.offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N), (uint32_t) ref::row_bytes(ed.type, NFF),
                     N, NFF};
@@ -589,6 +594,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     const double g = cx_->run(ds);
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
+    if (dump_rt_) dump_routing_rows(b.ids_all.as<int32_t>(), b.wts_all.as<float>(), nT, G_NL, b.C, TOPK);   // the prompt rows
     // the host side of the commit: the PLE history (the last 9 normalized rows) and the n-gram context
     if (ple_on_) {
         using namespace strata::kernels;

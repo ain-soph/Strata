@@ -72,6 +72,12 @@ constant bool QSA_MROPE [[function_constant(24)]];
 constant bool qsa_mrope = is_function_constant_defined(QSA_MROPE) && QSA_MROPE;
 constant bool QSA_ROWS_C [[function_constant(30)]];
 constant bool qsa_rows = is_function_constant_defined(QSA_ROWS_C) && QSA_ROWS_C;
+// QSA_UNDO (function constant 35, ain-soph serving; the decode windows): before a window row writes its indexer key into tail[cell % 4],
+// the value it replaces goes to undo[t] (buffer 22, ID floats per row).  A row the verification rejects may have replaced the raw key of
+// a cell that is kept (cell 4b + 4 over cell 4b when the window starts at 4b + 2 and keeps one row); Window::commit / commit_rows put
+// the replaced values back for the rejected rows, last row first, so block b pools the kept keys.  Off: exactly the kernel without it.
+constant bool QSA_UNDO_C [[function_constant(35)]];
+constant bool qsa_undo = is_function_constant_defined(QSA_UNDO_C) && QSA_UNDO_C;
 // QSA_ROWS (function constant 30): the rows of the window are DIFFERENT sequences (batch slots), one token each, each at its own
 // cell and in its own slot of the caches.  A buffer rinfo (uint) carries the strides between the slots' caches, in elements:
 // [0] kq / vq (chars), [1] ksc / vsc (halves), [2] tail, [3] dead, [4] pooled (floats), [5] GDN state (floats), [6] conv history
@@ -136,6 +142,7 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
                      device float* pooled [[buffer(18)]], constant QsaArgs& a [[buffer(19)]],
                      device const int* mtab [[buffer(20)]],
                      device const uint* rinfo [[buffer(21), function_constant(qsa_rows)]],
+                     device float* undo [[buffer(22), function_constant(qsa_undo)]],
                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     threadgroup float part[8];
@@ -156,7 +163,10 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
                 mt = mtab + rinfo[8 + 4 * t + 3];
             }
             const float x = tid < ID ? ikraw[t * ID + tid] : 0.0f;
-            if (tid < ID) tail_t[(cell & 3) * ID + tid] = x;
+            if (tid < ID) {
+                if (qsa_undo) undo[t * ID + tid] = tail_t[(cell & 3) * ID + tid];   // (the same thread reads, then writes)
+                tail_t[(cell & 3) * ID + tid] = x;
+            }
             threadgroup_barrier(mem_flags::mem_device);
             if (cell == 0) {
                 const float o = norm_rope(x, 0.0f, ikn, row, part, tid, sg, lane, ID, a.eps, cs, 0, false, mt);

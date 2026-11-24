@@ -141,7 +141,7 @@ int g_prompt_chunk_auto = 0;   // --prefill auto: the Metal prompt chunk's defau
 // format is the CPU pool's (generate.cpp drive_pool; terminal/tools/make_profile.py): int32 layer, int32 k, k int32 expert ids,
 // k float32 router weights.  Resident windows only: every layer's router writes its ids / weights into its own slice of one
 // buffer (no extra dispatch, no copy); the host writes the rows the engine keeps (a decode window's accepted prefix at commit,
-// every row of a batch window, every row of a prompt chunk), token by token, layers 0..47 each.  Off: nothing allocated, the
+// every row of a batch window - with draft rows its kept rows, at commit_rows - every row of a prompt chunk), token by token, layers 0..47 each.  Off: nothing allocated, the
 // graphs are the ones without it.
 std::string g_dump_routing_path;
 std::FILE* g_dump_routing = nullptr;
@@ -2894,8 +2894,9 @@ void Window::flush_post() {
 
 // The kept prefix of each slot's segment: the GDN layers' fold over the window's own inputs of those rows (gdn_step#m with commit,
 // bitwise the window's trajectory as Window::fold), into the slot's physical set; the history parity turns; the PLE history and the
-// slot's token pair take the kept rows.  Rows past the prefix leave nothing behind (their K/V and indexer cells are rewritten
-// when those cells run again, before anything reads them).
+// slot's token pair take the kept rows.  Rows past the prefix leave nothing behind: their K/V and pooled indexer cells are
+// rewritten when those cells run again, before anything reads them, and (QSA_UNDO) the raw indexer keys they wrote into the
+// tail ring are put back here.
 bool Window::commit_rows(const int* keep, std::string& err) {
     if (pend_segs_.empty()) return true;
     using namespace strata::kernels;
@@ -2919,7 +2920,6 @@ bool Window::commit_rows(const int* keep, std::string& err) {
     bool first_d = post_ds_.empty();
     for (const PendSeg& sg : pend_segs_) {
         const int b = sg.set - 1, m = keep[b];
-        if (m < 1 || m > sg.n) { err = "metal window: a slot's kept rows are outside its segment"; pend_segs_.clear(); return false; }
         SeqSet& st = *sets_[(size_t) sg.set];
         const int phys = physical_set(sg.set), hp = st.hp;
         if (qsa_undo_ && m < sg.n) {   // the segment's rejected rows: their indexer keys out of the slot's tail ring, last row first
@@ -3045,8 +3045,8 @@ bool Window::commit(int n_keep, std::string& err) {
     using namespace strata::kernels;
     if (last_T_ > 1) {
         // the GDN layers: the kept prefix folded into the state (gdn_step over n_keep tokens from the window's own
-        // inputs, with commit; bitwise the window's trajectory).  K/V and indexer cells past the prefix are rewritten
-        // when those positions run again, before anything reads them.
+        // inputs, with commit; bitwise the window's trajectory).  K/V and pooled indexer cells past the prefix are
+        // rewritten when those positions run again, before anything reads them; the tail ring is restored below.
         static const bool lazy = !(std::getenv("STRATA_METAL_LAZY_FOLD") && std::string(std::getenv("STRATA_METAL_LAZY_FOLD")) == "0");
         int nf = n_keep;
         if (nf > 0) {

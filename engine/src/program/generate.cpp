@@ -198,6 +198,7 @@
 namespace strata::metal_engine {
 void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
+void set_dump_routing(const char* path);   // metal/src/engine/window.cpp: --dump-routing on the Metal window
 int64_t prompt_chunk_for_auto();   // metal/src/engine/window.cpp: --prefill auto's chunk (4 Metal prompt chunks a call)
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
 bool window_compact_batch();
@@ -5314,6 +5315,9 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)   // Apple Silicon: every expert is on the GPU; ggml-cpu (NEON) is the only CPU expert code
     strata::metal_engine::set_model_shard(o.native_preset.c_str());   // the decode window reads the model GGUF itself
     strata::metal_engine::set_batch_slots(o.batch);
+    // --dump-routing: the routed experts run in the Metal window, never in the CPU pool; the window writes the trace (the same
+    // records) from its own routers' outputs (metal/src/engine/window.cpp dump_routing_rows)
+    if (!o.dump_routing.empty()) strata::metal_engine::set_dump_routing(o.dump_routing.c_str());
     o.mmap_experts = true;   // ... experts included: no resident copy of them (the GGUF shards in place)
     if (false) {
 #else
@@ -10405,7 +10409,12 @@ int main(int argc, char** argv) {
         strata::core::stage_timing_name(15, "  gdn: out gemv");
     }
     std::FILE* routing = nullptr;
+#if defined(STRATA_GPU_METAL)
+    // Apple Silicon: the window writes the trace (set_dump_routing beside set_batch_slots above)
+    if (false) {
+#else
     if (!o.dump_routing.empty()) {
+#endif
         if (o.no_pool) {
             std::fprintf(stderr, "strata generate: --dump-routing needs the expert pool; the routed ids reach "
                                  "the host through the doorbell the pool reads. Drop --no-pool.\n");

@@ -265,8 +265,8 @@ kernel void moe_gu(device const uchar* W [[buffer(0)]], device const float* x [[
 }
 
 // ---- down ---------------------------------------------------------------------------------------------------------
-template <int F, int LPR, int NR, int NE>
-static inline void dn_body(device const uchar* d0, device const float* h, device const float* hs16, device float* ye,
+template <int F, int LPR, int NR, int NE, typename YP = device float*>
+static inline void dn_body(device const uchar* d0, device const float* h, device const float* hs16, YP ye,
                            device const int* plan, int c, int row0, int li, constant MoeArgs& a,
                            threadgroup const uint* tab) {
     constexpr int UNIT = fmt<F>::UNIT;

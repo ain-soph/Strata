@@ -1,4 +1,4 @@
-> **ain-soph fork (`serving` branch, based on upstream `main` 73d4f41, v0.2.20 + 13).** What differs from upstream:
+> **ain-soph fork (`serving` branch, based on upstream `main` 73d4f41, v0.2.20 + 14).** What differs from upstream:
 >
 > | Change | Why | Enable / default | Effect (M5 Ultra) |
 > |---|---|---|---|
@@ -9,6 +9,7 @@
 > | Metal compact batching | Reuse an idle slot for prompt reads and conversation restore | `STRATA_METAL_COMPACT_BATCH=1` with `--batch 2` | AD-4.27, 262K: peak wired 70,962 → 67,061 MiB; identical sampled responses |
 > | Compact batch rows read the M-RoPE table of their physical set | With `--vision` and compact batching, a row in logical slot 2 read an unused, zeroed M-RoPE table, so one of two concurrent replies could differ from its solo answer | Always (compact batching) | picture + text c=2 probe: 11/18 → 18/18 batched = solo; speed within ±0.4% |
 > | Fold a pending verify-window commit before the main state changes buffers and before per-slot batch windows | A deferred GDN fold was not applied before `select_main_slot`, `run_rows` or `run_slots`: a follow-up after a long unparked request was read again from token 0, or the fold could land in the other slot | Always | follow-up reuse after a long request: 0/2 → 2/2 (= control); outputs unchanged; speed unchanged |
+> | Metal decode: routed down and shared-expert combine in one dispatch (`moe_down_comb`); `--dump-routing` on the Metal engine | One barrier group a layer fewer; the routing trace for expert-placement studies was CPU-pool only | down+combine on (`STRATA_METAL_DOWN_COMB=0` disables); trace off unless `--dump-routing PATH` / `STRATA_METAL_DUMP_ROUTING=PATH` | AD-4.27 c=1 decode 151.5 → 153.4 tok/s (+1.2%), bitwise-identical output, prefill and memory unchanged |
 >
 > Full numbers: [Qwen3.8 Flash-Next in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#文本qwen38-flash-nextstrata). Upstream PRs: issue [#6182](https://github.com/Niko1221/Strata/issues/6182) + draft PR [#6183](https://github.com/Niko1221/Strata/pull/6183). The closed-stdin EngineDied fix is upstream (#6055) and no longer carried here.
 
